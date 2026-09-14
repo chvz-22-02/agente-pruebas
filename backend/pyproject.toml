@@ -1,0 +1,49 @@
+[project]
+name = "agente-pruebas-backend"
+version = "0.1.0"
+description = "Backend de agentes locales para testear servidores MCP"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.6.0",
+    "httpx>=0.27.0",
+    "mcp>=2.0.0",
+    "httpx2>=0.1.0",
+    "aiosqlite>=0.20.0",
+    "mlflow>=3.1.0",
+    "python-dotenv>=1.0.1",
+    "sse-starlette>=2.1.3",
+    "anthropic>=1.0.0",
+    # Ficheros de personas y casos de evaluacion. Ya llega con MLflow, pero se
+    # declara porque el backend lo usa directamente.
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["ruff>=0.7.0", "pytest>=8.3.0", "pytest-asyncio>=0.24.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "PYI"]
+# La observabilidad y el cliente MCP capturan excepciones a proposito: un fallo
+# de MLflow o de un servidor MCP nunca debe tumbar el agente.
+ignore = ["E501", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+# ASYNC109: el timeout explicito es parte del contrato con la cola de comandos.
+# PYI034: los tee devuelven self; la anotacion literal es intencionada para
+#         cumplir el Protocol ReadStream/WriteStream del SDK de MCP.
+"app/mcpclient/connection.py" = ["ASYNC109"]
+"app/mcpclient/tee.py" = ["PYI034"]
