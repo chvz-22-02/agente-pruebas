@@ -742,6 +742,9 @@ class EvalJob:
         )
         if judge_trace:
             await tracker.set_tags(run_id, {"eval.judge_trace_id": judge_trace})
+            # Las trazas del agente ya se enlazan al run padre al cerrarse;
+            # la del juez se cuelga aqui para que la bateria las liste juntas.
+            await tracker.link_traces(self.parent_run_id, [judge_trace])
 
         # Los juicios se cuelgan de la ultima traza del agente: en la vista de
         # traces de MLflow aparecen como "assessments" de esa conversacion.
