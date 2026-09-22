@@ -8,6 +8,7 @@ construye el payload, que es donde estan las diferencias que rompen.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -16,7 +17,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.llm.anthropic_provider import AnthropicProvider  # noqa: E402
 from app.llm.base import ToolSpec  # noqa: E402
 from app.llm.catalog import CATALOG, model_info  # noqa: E402
-from app.llm.cloud_openai_providers import GoogleProvider, OpenAIProvider  # noqa: E402
+from app.llm.cloud_openai_providers import (  # noqa: E402
+    CloudflareProvider,
+    GoogleProvider,
+    MissingAccountId,
+    NvidiaProvider,
+    OpenAIProvider,
+)
 from app.llm.schema_utils import sanitize_tool_schema  # noqa: E402
 
 CONVERSATION = [
@@ -153,7 +160,7 @@ def test_cloud_never_inherits_local_url() -> None:
     """
     from app.llm.registry import default_base_url
 
-    for name in ("anthropic", "openai", "google"):
+    for name in ("anthropic", "openai", "google", "cloudflare", "nvidia"):
         url = default_base_url(name)
         assert url.startswith("https://"), f"{name} deberia salir a internet, no a {url}"
         assert "127.0.0.1" not in url and "localhost" not in url
@@ -414,6 +421,196 @@ def test_gemini3_effort_and_rejection_memory() -> None:
     print("  gemini 3.x: reasoning_effort medium/low y se recuerda el rechazo")
 
 
+CF_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1"
+CF_MODEL = "@cf/zai-org/glm-4.7-flash"
+
+
+def test_cloudflare_account_id_resolution() -> None:
+    """El Account ID de la UI manda; si no llega, se usa CLOUDFLARE_ACCOUNT_ID."""
+    import os
+
+    previous = os.environ.pop("CLOUDFLARE_ACCOUNT_ID", None)
+    try:
+        explicit = CloudflareProvider(CF_URL, CF_MODEL, api_key="dummy", account_id="abc123")
+        assert explicit.base_url.endswith("/accounts/abc123/ai/v1"), explicit.base_url
+        assert str(explicit._client.base_url).rstrip("/").endswith("/accounts/abc123/ai/v1")
+
+        # URL ya resuelta desde la UI: se respeta tal cual.
+        typed = CloudflareProvider(CF_URL.replace("{account_id}", "uiacct"), CF_MODEL, api_key="dummy")
+        assert "/accounts/uiacct/" in typed.base_url
+
+        os.environ["CLOUDFLARE_ACCOUNT_ID"] = "envacct"
+        from_env = CloudflareProvider(CF_URL, CF_MODEL, api_key="dummy")
+        assert "/accounts/envacct/" in from_env.base_url
+        del os.environ["CLOUDFLARE_ACCOUNT_ID"]
+
+        missing = CloudflareProvider(CF_URL, CF_MODEL, api_key="dummy")
+        assert not missing.has_account
+        health = asyncio.run(missing.health())
+        assert not health["ok"] and "Account ID" in health["error"], health
+        try:
+            asyncio.run(missing.chat([{"role": "user", "content": "hola"}]))
+        except MissingAccountId:
+            pass
+        else:
+            raise AssertionError("sin Account ID no deberia llegar a hacer la peticion")
+    finally:
+        if previous is not None:
+            os.environ["CLOUDFLARE_ACCOUNT_ID"] = previous
+    print("  cloudflare: Account ID desde la UI, la URL o el entorno; sin el, error claro")
+
+
+def test_cloudflare_payload() -> None:
+    provider = CloudflareProvider(CF_URL, CF_MODEL, api_key="dummy", account_id="acct")
+    payload = {"model": CF_MODEL, "max_tokens": 4096, "temperature": 0.6, "top_p": 0.95}
+
+    on = provider._adapt(dict(payload), thinking=True)
+    assert on["max_tokens"] == 4096 and "max_completion_tokens" not in on
+    assert on["temperature"] == 0.6 and on["reasoning_effort"] == "medium", on
+    assert provider._adapt(dict(payload), thinking=False)["reasoning_effort"] == "low"
+
+    # Un modelo sin razonamiento no recibe reasoning_effort.
+    plain = provider._adapt({"model": "@cf/meta/llama-4-scout-17b-16e-instruct", "max_tokens": 10}, True)
+    assert "reasoning_effort" not in plain
+
+    # El turno del asistente que solo trae tool_calls lleva content "" (texto),
+    # no null: el esquema de Workers AI declara content como string.
+    serialized = provider._serialize_messages(
+        [{"role": "assistant", "content": "", "tool_calls": CONVERSATION[2]["tool_calls"]}]
+    )
+    assert serialized[0]["content"] == "" and len(serialized[0]["tool_calls"]) == 2
+    assert "extra_content" not in serialized[0]["tool_calls"][0]
+    print("  cloudflare: max_tokens, temperature y reasoning_effort segun el catalogo")
+
+
+def test_cloudflare_lists_models_with_function_calling() -> None:
+    import httpx
+
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        assert request.headers["authorization"] == "Bearer dummy"
+        return httpx.Response(200, json={"success": True, "result": [
+            {"name": "@cf/zai-org/glm-4.7-flash", "task": {"name": "Text Generation"},
+             "properties": [{"property_id": "function_calling", "value": "true"}]},
+            {"name": "@cf/meta/llama-3.1-8b-instruct", "task": {"name": "Text Generation"},
+             "properties": [{"property_id": "context_window", "value": "8000"}]},
+            {"name": "@cf/openai/gpt-oss-20b", "task": {"name": "Text Generation"},
+             "properties": [{"property_id": "function_calling", "value": True}]},
+        ]})
+
+    provider = CloudflareProvider(CF_URL, CF_MODEL, api_key="dummy", account_id="acct")
+    provider._client = httpx.AsyncClient(
+        base_url=provider.base_url, headers=provider._client.headers, transport=httpx.MockTransport(handler)
+    )
+    models = asyncio.run(provider.list_models())
+    assert models == ["@cf/openai/gpt-oss-20b", "@cf/zai-org/glm-4.7-flash"], models
+    assert "/accounts/acct/ai/models/search" in seen[0] and "task=Text+Generation" in seen[0], seen
+
+    # Sin informacion de function calling en ningun modelo: no se vacia la lista.
+    rows = [{"name": "@cf/a", "task": {"name": "Text Generation"}}, {"name": "@cf/emb", "task": {"name": "Text Embeddings"}}]
+    assert CloudflareProvider._select_models(rows) == ["@cf/a"]
+    print("  cloudflare: modelos reales via /ai/models/search, solo con function calling")
+
+
+def test_cloudflare_errors_are_actionable() -> None:
+    import httpx
+
+    from app.llm.openai_compat_provider import _error_text
+
+    body = {"success": False, "errors": [{"code": 4006, "message": "you have used up your daily free allocation of 10,000 neurons"}]}
+    detail = _error_text(httpx.Response(429, json=body))
+    assert "codigo 4006" in detail and "neurons" in detail, detail
+
+    provider = CloudflareProvider(CF_URL, CF_MODEL, api_key="dummy", account_id="acct")
+    assert "00:00 UTC" in provider._explain_error(429, detail)
+    assert "Workers AI" in provider._explain_error(401, "Authentication error (codigo 10000)")
+    # El resto de proveedores no cambia sus mensajes.
+    assert OpenAIProvider("https://api.openai.com/v1", "gpt-5", api_key="d")._explain_error(429, "x") == "x"
+    print("  cloudflare: errores del free tier y de permisos con indicaciones")
+
+
+NV_URL = "https://integrate.api.nvidia.com/v1"
+
+
+def test_nvidia_thinking_via_template_kwargs() -> None:
+    provider = NvidiaProvider(NV_URL, "nvidia/nemotron-3-super-120b-a12b", api_key="nvapi-dummy")
+    base = {"model": "nvidia/nemotron-3-super-120b-a12b", "max_tokens": 4096, "temperature": 0.6}
+
+    on = provider._adapt(dict(base), thinking=True)
+    # Nemotron/Qwen leen `enable_thinking`; Kimi/GLM/DeepSeek, `thinking`.
+    assert on["chat_template_kwargs"] == {"enable_thinking": True, "thinking": True}, on
+    assert on["max_tokens"] == 4096 and "reasoning_effort" not in on and on["temperature"] == 0.6
+    off = provider._adapt(dict(base), thinking=False)
+    assert off["chat_template_kwargs"] == {"enable_thinking": False, "thinking": False}
+
+    # Los que razonan siempre o nunca no reciben el parametro.
+    assert "chat_template_kwargs" not in provider._adapt({"model": "openai/gpt-oss-20b"}, True)
+    assert "chat_template_kwargs" not in provider._adapt({"model": "mistralai/mistral-nemotron"}, True)
+    # Fuera del catalogo se intenta; si el endpoint lo rechazo, no se vuelve a mandar.
+    assert "chat_template_kwargs" in provider._adapt({"model": "qwen/qwen3-next"}, True)
+    provider._accepts_template_kwargs = False
+    assert "chat_template_kwargs" not in provider._adapt(dict(base), True)
+    print("  nvidia: razonamiento en chat_template_kwargs solo donde es conmutable")
+
+
+def test_nvidia_model_filter() -> None:
+    ids = [
+        "nvidia/nemotron-3-super-120b-a12b", "nvidia/nv-embedqa-mistral-7b-v2", "moonshotai/kimi-k2.6",
+        "nvidia/llama-3.1-nemoguard-8b-content-safety", "nvidia/nemotron-4-340b-reward",
+        "nvidia/nemotron-parse", "snowflake/arctic-embed-l", "nvidia/riva-translate-4b-instruct",
+        "z-ai/glm-5.3-flash",
+    ]
+    assert NvidiaProvider(NV_URL, "x", api_key="d")._filter_models(ids) == [
+        "moonshotai/kimi-k2.6", "nvidia/nemotron-3-super-120b-a12b", "z-ai/glm-5.3-flash",
+    ]
+    print("  nvidia: fuera embeddings, guardarrailes, parsers, reward y traduccion")
+
+
+def test_nvidia_retries_on_rate_limit() -> None:
+    import httpx
+
+    from app.llm import cloud_openai_providers as mod
+
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429, headers={"Retry-After": "0"}, json={"detail": "Too Many Requests"})
+        if calls["n"] == 2:
+            return httpx.Response(500, json={"detail": "Internal server error"})
+        if calls["n"] == 3:
+            # El free tier tambien responde 503 cuando va saturado: transitorio.
+            return httpx.Response(503, headers={"Retry-After": "0"}, json={"detail": "Service temporarily overloaded"})
+        return httpx.Response(200, json={
+            "model": "moonshotai/kimi-k2.6",
+            "choices": [{"message": {"content": "hola"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+        })
+
+    provider = NvidiaProvider(NV_URL, "moonshotai/kimi-k2.6", api_key="nvapi-dummy")
+    provider._client = httpx.AsyncClient(base_url=NV_URL, transport=httpx.MockTransport(handler))
+    mod.NVIDIA_BASE_WAIT_S, saved_wait = 0.0, mod.NVIDIA_BASE_WAIT_S  # el 500 no trae Retry-After
+    response = asyncio.run(provider.chat([{"role": "user", "content": "hola"}], thinking=False))
+    assert response.content == "hola" and calls["n"] == 4, (response, calls)
+
+    mod.NVIDIA_BASE_WAIT_S = saved_wait
+    # Sin Retry-After: backoff exponencial acotado.
+    no_header = httpx.Response(429)
+    assert NvidiaProvider._retry_wait(no_header, 0) == mod.NVIDIA_BASE_WAIT_S
+    assert NvidiaProvider._retry_wait(no_header, 10) == mod.NVIDIA_MAX_WAIT_S
+    assert "40 peticiones" in provider._explain_error(429, "Too Many Requests")
+
+    from app.llm.openai_compat_provider import _error_text
+
+    forbidden = httpx.Response(403, json={"status": 403, "title": "Forbidden", "detail": "Authorization failed"})
+    assert _error_text(forbidden) == "Forbidden: Authorization failed"
+    assert "saturado" in provider._explain_error(503, "Service temporarily overloaded")
+    print("  nvidia: 429, 500 y 503 del free tier se reintentan respetando Retry-After")
+
+
 def test_catalog_consistency() -> None:
     for name, info in CATALOG.items():
         assert info.name == name
@@ -443,6 +640,13 @@ if __name__ == "__main__":
         test_gemini_thought_signature_roundtrip,
         test_gemini3_effort_and_rejection_memory,
         test_thought_signature_never_leaks_to_other_providers,
+        test_cloudflare_account_id_resolution,
+        test_cloudflare_payload,
+        test_cloudflare_lists_models_with_function_calling,
+        test_cloudflare_errors_are_actionable,
+        test_nvidia_thinking_via_template_kwargs,
+        test_nvidia_model_filter,
+        test_nvidia_retries_on_rate_limit,
         test_catalog_consistency,
     ]:
         print(f"{test.__name__}:")

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, pullModel, type PullEvent } from "../lib/api";
+import { accountFromUrl, withAccount } from "../lib/providers";
 import type {
   BackendConfig,
   CatalogModel,
@@ -74,14 +75,48 @@ function useModelFeatures(provider: string, baseUrl: string, model: string) {
 }
 
 /** Credenciales del proveedor de nube + validacion contra su API. */
+/**
+ * Identificador de cuenta para proveedores cuya URL lo lleva (Cloudflare).
+ * No es un secreto: solo compone la URL. Vacio = lo pone el backend desde
+ * su variable de entorno.
+ */
+function AccountIdBox({
+  info,
+  baseUrl,
+  onBaseUrlChange,
+}: {
+  info: ProviderInfo;
+  baseUrl: string;
+  onBaseUrlChange: (url: string) => void;
+}) {
+  const value = accountFromUrl(info.default_base_url, baseUrl);
+  return (
+    <label className="field">
+      <span>
+        Account ID <code>({info.account_env})</code>
+      </span>
+      <input
+        value={value}
+        onChange={(e) => onBaseUrlChange(withAccount(info.default_base_url, e.target.value))}
+        placeholder={`vacio = ${info.account_env} de backend/.env`}
+        spellCheck={false}
+        autoComplete="off"
+      />
+    </label>
+  );
+}
+
 function ApiKeyBox({
   info,
   value,
+  baseUrl,
   onChange,
   onModels,
 }: {
   info: ProviderInfo;
   value: string;
+  /** URL efectiva: en Cloudflare ya lleva el Account ID. */
+  baseUrl: string;
   onChange: (v: string) => void;
   onModels: (models: string[]) => void;
 }) {
@@ -95,7 +130,7 @@ function ApiKeyBox({
     try {
       const result = await api.post<ProbeResult>("/api/llm/probe", {
         provider: info.name,
-        base_url: info.default_base_url || null,
+        base_url: baseUrl || info.default_base_url || null,
         api_key: value || null,
       });
       setProbe(result);
@@ -359,10 +394,15 @@ export default function ModelPanel(props: Props) {
         </select>
       </label>
 
+      {info?.account_env && (
+        <AccountIdBox info={info} baseUrl={baseUrl} onBaseUrlChange={props.onBaseUrlChange} />
+      )}
+
       {info?.needs_api_key && (
         <ApiKeyBox
           info={info}
           value={apiKey}
+          baseUrl={baseUrl}
           onChange={(v) => props.onApiKeyChange(provider, v)}
           onModels={props.onModelsRefreshed}
         />

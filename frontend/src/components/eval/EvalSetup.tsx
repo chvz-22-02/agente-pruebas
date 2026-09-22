@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../lib/api";
+import { accountFromUrl, withAccount } from "../../lib/providers";
 import type { BackendConfig, EvalValidation, MlflowExperiment, RoleConfig } from "../../lib/types";
 
 export type AgentSettings = {
@@ -166,13 +167,24 @@ function RoleEditor({
               ))}
             </datalist>
           </div>
-          <input
-            value={value.base_url}
-            onChange={(e) => set({ base_url: e.target.value })}
-            placeholder={`URL base (por defecto ${info?.default_base_url || "la del backend"})`}
-            spellCheck={false}
-            style={{ marginBottom: 6 }}
-          />
+          {info?.account_env ? (
+            // La URL de Cloudflare lleva la cuenta dentro: se pide solo el Account ID.
+            <input
+              value={accountFromUrl(info.default_base_url, value.base_url)}
+              onChange={(e) => set({ base_url: withAccount(info.default_base_url, e.target.value) })}
+              placeholder={`Account ID (vacio = ${info.account_env} de backend/.env)`}
+              spellCheck={false}
+              style={{ marginBottom: 6 }}
+            />
+          ) : (
+            <input
+              value={value.base_url}
+              onChange={(e) => set({ base_url: e.target.value })}
+              placeholder={`URL base (por defecto ${info?.default_base_url || "la del backend"})`}
+              spellCheck={false}
+              style={{ marginBottom: 6 }}
+            />
+          )}
           {info?.needs_api_key && (
             <p className="muted" style={{ margin: "0 0 6px" }}>
               Usa la clave de {info.label} guardada en la pestana <strong>Modelo</strong> (o la del backend).

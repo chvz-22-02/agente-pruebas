@@ -124,6 +124,8 @@ introduciendo la clave desde la interfaz. No hace falta reiniciar el backend ni 
 | **Anthropic** | Claude Opus 5 · Sonnet 5 · Opus 4.8 · Sonnet 4.6 · Haiku 4.5 · Fable 5.1 |
 | **OpenAI** | GPT-5 · GPT-5 mini · GPT-5 nano · GPT-4.1 · GPT-4.1 mini · o4-mini |
 | **Google** | Familias Gemini **pro**, **flash** y **flash-lite**, incluidos los `-preview` |
+| **Cloudflare Workers AI** | GLM-4.7 Flash · gpt-oss 120B / 20B · Qwen3 30B · Mistral Small 3.1 · Llama 4 Scout · Llama 3.3 70B (solo modelos con *function calling*) |
+| **NVIDIA (build.nvidia.com)** | Nemotron 3 Super · GLM-5.3 / 5.3 Flash · DeepSeek V4 Flash · gpt-oss 20B · Mistral Nemotron |
 
 Flujo: elige el proveedor → pega la clave → **Validar**. Si la clave es buena, el desplegable
 de modelos se rellena con **los modelos reales de tu cuenta** (consultados a la API), no solo
@@ -141,12 +143,76 @@ Dos opciones, y el backend acepta las dos:
 1. **En la UI.** Se guarda en el `localStorage` del navegador para no repegarla cada vez.
    Es cómodo, pero no es un almacén de secretos: cualquier script que corra en ese origen
    puede leerla.
-2. **En el backend.** Deja el campo vacío y define `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` o
-   `GOOGLE_API_KEY` en `backend/.env`. El backend la usa cuando la UI no manda ninguna.
+2. **En el backend.** Deja el campo vacío y define `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+   `GOOGLE_API_KEY`, `CLOUDFLARE_API_TOKEN` o `NVIDIA_API_KEY` en `backend/.env`. El backend la usa cuando la UI
+   no manda ninguna.
 
 En ambos casos la clave se usa solo para la petición en curso: **no se persiste en SQLite, no
 se registra en MLflow y no aparece en los logs**. La caché de clientes se indexa por un hash
 de la clave, no por la clave.
+
+#### Cloudflare Workers AI (free tier)
+
+Workers AI regala **10.000 neuronas al día** (se reinicia a las 00:00 UTC; al agotarlas las
+peticiones fallan hasta el reinicio, salvo que tengas el plan de pago). Necesita dos datos:
+
+1. **API token** con el permiso *Workers AI* (Read basta para listar modelos; para inferencia,
+   la plantilla *Workers AI* del panel). Se crea en
+   [dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens).
+2. **Account ID** de la misma cuenta (panel de Cloudflare → *Workers AI*).
+
+```ini
+# backend/.env
+CLOUDFLARE_API_TOKEN=...
+CLOUDFLARE_ACCOUNT_ID=...
+```
+
+Los dos se pueden escribir también en la pestaña **Modelo** (el Account ID tiene su propio
+campo, porque va dentro de la URL `.../accounts/<id>/ai/v1`). Detalles:
+
+* Se usa el **endpoint compatible con OpenAI** de Workers AI, así que el agente, el simulador y
+  el evaluador funcionan igual que con cualquier otro proveedor.
+* **Validar** lista los modelos reales de la cuenta con la API propia de Workers AI
+  (`/ai/models/search`, porque `/v1/models` no existe) y deja solo los de **generación de texto
+  con function calling**: sin herramientas un modelo no sirve para probar un MCP.
+* Los modelos de razonamiento (GLM-4.7 Flash, gpt-oss, Qwen3) reciben `reasoning_effort`; si
+  alguno lo rechaza, se retira y se recuerda.
+* **Qué modelo elegir para estirar el free tier:** el coste va por tokens, y los MCP con
+  descripciones largas gastan mucho en entrada (con SIRTOD, 35k–130k tokens por caso de
+  evaluación). `@cf/zai-org/glm-4.7-flash` es de los más baratos por token y tiene 131K de
+  contexto; `gpt-oss-120b` es más capaz pero agota el cupo varias veces antes. Evita los de
+  ventana corta (Llama 3.3 70B, 24K) con MCP de muchas herramientas.
+* Al agotar el cupo, el error lo dice explícitamente (código `4006`) en lugar de un 429 mudo.
+
+#### NVIDIA build.nvidia.com (endpoints gratuitos)
+
+Los modelos alojados de [build.nvidia.com](https://build.nvidia.com) son gratuitos para
+prototipar con el NVIDIA Developer Program. **No hay cupo de tokens, pero sí un límite de 40
+peticiones por minuto** por cuenta (se puede solicitar subirlo a 200).
+
+```ini
+# backend/.env — clave en build.nvidia.com/settings/api-keys
+NVIDIA_API_KEY=nvapi-...
+```
+
+* Endpoint compatible con OpenAI en `https://integrate.api.nvidia.com/v1`. **Validar** lista
+  los modelos del catálogo quitando los que no conversan (embeddings, rerankers,
+  guardarraíles, *parsers*, traducción, recompensa).
+* **Razonamiento:** en estos modelos no hay `reasoning_effort`; lo lee la plantilla de chat de
+  cada uno. Nemotron usa `enable_thinking` y Kimi, GLM o DeepSeek usan `thinking`, así que
+  el interruptor manda ambas en `chat_template_kwargs`. Si el endpoint rechaza el parámetro,
+  se retira y se recuerda. `gpt-oss` razona siempre y `mistral-nemotron` nunca.
+* **Límite de 40 RPM y fallos intermitentes:** una evaluación encadena muchas peticiones
+  (varias por turno del agente, más el simulador y el evaluador), y los endpoints gratuitos
+  devuelven a veces `500 Internal server error` o `503 Service temporarily overloaded` a una
+  petición que al reintentarla funciona. Ante `429`, `500`, `502`, `503` o `504` el backend
+  espera lo que indique `Retry-After` (o 2 s, 4 s, 8 s… hasta 30 s) y reintenta hasta 5 veces
+  antes de dar error.
+* **Modelos comprobados con tool calling en el free tier** (2026-09-17): Nemotron 3 Super
+  responde en ~1 s; GLM-5.3 en ~15 s; gpt-oss 20B en ~1 min; GLM-5.3 Flash y DeepSeek V4
+  Flash tienen colas de varios minutos. `/v1/models` lista también modelos que una cuenta
+  gratuita no puede usar (`404 Function not found for account`), como Kimi K2.6 o Nemotron
+  Nano 3, por eso no están en el selector.
 
 #### Detalles de cada API que el código tiene en cuenta
 
@@ -234,7 +300,7 @@ implementaciones:
 
 * `ollama` — Ollama (por defecto).
 * `anthropic` — Claude, sobre el SDK oficial.
-* `openai` / `google` — OpenAI y Gemini.
+* `openai` / `google` / `cloudflare` / `nvidia` — OpenAI, Gemini, Workers AI y build.nvidia.com.
 * `openai_compat` — cualquier servidor con API compatible OpenAI: `llama-server` de
   llama.cpp, LM Studio, vLLM, TGI, LocalAI…
 
@@ -587,7 +653,7 @@ backend/app/
     catalog.py             proveedores y modelos que ofrece la UI
     ollama_provider.py     Ollama
     anthropic_provider.py  Claude (SDK oficial)
-    cloud_openai_providers.py  OpenAI y Gemini
+    cloud_openai_providers.py  OpenAI, Gemini, Cloudflare Workers AI y NVIDIA
     openai_compat_provider.py  llama.cpp / LM Studio / vLLM / ...
     registry.py            fábrica y caché de proveedores (clave por hash)
   mcpclient/

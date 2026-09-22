@@ -36,14 +36,15 @@ class LLMRequestError(RuntimeError):
         self.status = status
         self.detail = detail
         self.payload_keys = sorted(payload) if payload else []
-        model = (payload or {}).get("model", "?")
+        # Sin payload el error viene de listar modelos, no de una peticion a un modelo.
+        where = f" de '{payload.get('model', '?')}'" if payload else ""
         hint = ""
         if status == 404:
             hint = (
                 " — ese identificador no existe en tu cuenta. Pulsa 'Validar' en la "
                 "pestana Modelo para ver los que si estan disponibles."
             )
-        super().__init__(f"HTTP {status} de '{model}': {detail}{hint}")
+        super().__init__(f"HTTP {status}{where}: {detail}{hint}")
 
 
 def _error_text(response: httpx.Response) -> str:
@@ -55,6 +56,19 @@ def _error_text(response: httpx.Response) -> str:
     error = body.get("error") if isinstance(body, dict) else None
     if isinstance(error, dict):
         return str(error.get("message") or error)[:300]
+    # Formato de la API de Cloudflare: {"errors": [{"code": 4006, "message": "..."}]}.
+    errors = body.get("errors") if isinstance(body, dict) else None
+    if not error and isinstance(errors, list) and errors:
+        parts = [
+            f"{e.get('message', e)} (codigo {e['code']})" if isinstance(e, dict) and e.get("code")
+            else str(e.get("message", e) if isinstance(e, dict) else e)
+            for e in errors
+        ]
+        return "; ".join(parts)[:300]
+    # Formato "problem details" (NVIDIA): {"status": 403, "title": "Forbidden", "detail": "..."}.
+    if not error and isinstance(body, dict) and isinstance(body.get("detail"), str):
+        title = body.get("title")
+        return (f"{title}: {body['detail']}" if title else body["detail"])[:300]
     return str(error or body)[:300]
 
 
@@ -246,7 +260,9 @@ class OpenAICompatProvider(LLMProvider):
                 [t["function"]["name"] for t in payload.get("tools", [])],
                 sorted(k for k in payload if k not in {"messages", "tools"}),
             )
-            raise LLMRequestError(resp.status_code, _error_text(resp), payload)
+            raise LLMRequestError(
+                resp.status_code, self._explain_error(resp.status_code, _error_text(resp)), payload
+            )
         data = resp.json()
         latency_ms = (time.perf_counter() - started) * 1000
 
@@ -287,6 +303,10 @@ class OpenAICompatProvider(LLMProvider):
             model=data.get("model") or payload["model"],
             raw={},
         )
+
+    def _explain_error(self, status: int, detail: str) -> str:
+        """Gancho para traducir un rechazo del proveedor a algo accionable."""
+        return detail
 
     def _filter_models(self, ids: list[str]) -> list[str]:
         """Gancho para quedarse solo con los modelos utiles del proveedor."""

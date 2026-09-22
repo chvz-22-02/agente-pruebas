@@ -42,6 +42,9 @@ class ProviderInfo:
     key_env: str = ""
     key_hint: str = ""
     console_url: str = ""
+    # Variable de entorno con el identificador de cuenta, para proveedores cuya
+    # URL lo lleva dentro (Cloudflare). La URL por defecto trae `{account_id}`.
+    account_env: str = ""
     supports_pull: bool = False
     models: list[ModelInfo] = field(default_factory=list)
 
@@ -57,13 +60,13 @@ CATALOG: dict[str, ProviderInfo] = {
         default_base_url="http://127.0.0.1:11434",
         supports_pull=True,
         models=[
-            ModelInfo("qwen3:8b", "Qwen3 8B", "32K", "5,2 GB · equilibrio en CPU",
+            ModelInfo("qwen3:8b", "Qwen3 8B", "32K", "5,2 GB Â· equilibrio en CPU",
                       thinking="toggle", recommended=True),
-            ModelInfo("qwen3:4b", "Qwen3 4B", "32K", "2,6 GB · el doble de rapido",
+            ModelInfo("qwen3:4b", "Qwen3 4B", "32K", "2,6 GB Â· el doble de rapido",
                       thinking="toggle"),
-            ModelInfo("qwen3:14b", "Qwen3 14B", "32K", "9,3 GB · mas preciso, mas lento",
+            ModelInfo("qwen3:14b", "Qwen3 14B", "32K", "9,3 GB Â· mas preciso, mas lento",
                       thinking="toggle"),
-            ModelInfo("granite3.3:8b", "Granite 3.3 8B", "128K", "4,9 GB · buen tool calling"),
+            ModelInfo("granite3.3:8b", "Granite 3.3 8B", "128K", "4,9 GB Â· buen tool calling"),
         ],
     ),
     "anthropic": ProviderInfo(
@@ -139,6 +142,69 @@ CATALOG: dict[str, ProviderInfo] = {
                       "rapido y economico", thinking="effort"),
             ModelInfo("gemini-2.5-flash-lite", "Gemini 2.5 Flash Lite", "1M",
                       "el mas barato", thinking="effort"),
+        ],
+    ),
+    "cloudflare": ProviderInfo(
+        name="cloudflare",
+        label="Cloudflare Workers AI",
+        kind="cloud",
+        needs_api_key=True,
+        # El endpoint compatible con OpenAI cuelga de la cuenta. `{account_id}`
+        # se rellena con lo que escribas en la UI o con CLOUDFLARE_ACCOUNT_ID.
+        default_base_url="https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
+        key_env="CLOUDFLARE_API_TOKEN",
+        key_hint="token con permiso Workers AI",
+        console_url="https://dash.cloudflare.com/profile/api-tokens",
+        account_env="CLOUDFLARE_ACCOUNT_ID",
+        # Solo modelos con function calling: sin herramientas no sirven para
+        # probar un MCP. El free tier son 10.000 neuronas al dia (se reinicia a
+        # las 00:00 UTC); los mas baratos por token rinden mas conversaciones.
+        # Al validar el token, el desplegable se rellena con el catalogo real.
+        models=[
+            ModelInfo("@cf/zai-org/glm-4.7-flash", "GLM-4.7 Flash", "131K",
+                      "muy barato: el que mas rinde en el free tier", thinking="effort",
+                      recommended=True),
+            ModelInfo("@cf/openai/gpt-oss-120b", "gpt-oss 120B", "128K",
+                      "mas capaz, gasta el free tier antes", thinking="effort"),
+            ModelInfo("@cf/openai/gpt-oss-20b", "gpt-oss 20B", "128K",
+                      "rapido y economico", thinking="effort"),
+            ModelInfo("@cf/qwen/qwen3-30b-a3b-fp8", "Qwen3 30B A3B", "32K",
+                      "ventana corta para MCP con muchas herramientas", thinking="effort"),
+            ModelInfo("@cf/mistralai/mistral-small-3.1-24b-instruct", "Mistral Small 3.1 24B",
+                      "128K", "sin razonamiento"),
+            ModelInfo("@cf/meta/llama-4-scout-17b-16e-instruct", "Llama 4 Scout 17B", "131K",
+                      "sin razonamiento"),
+            ModelInfo("@cf/meta/llama-3.3-70b-instruct-fp8-fast", "Llama 3.3 70B fast", "24K",
+                      "ventana corta"),
+        ],
+    ),
+    "nvidia": ProviderInfo(
+        name="nvidia",
+        label="NVIDIA (build.nvidia.com)",
+        kind="cloud",
+        needs_api_key=True,
+        default_base_url="https://integrate.api.nvidia.com/v1",
+        key_env="NVIDIA_API_KEY",
+        key_hint="nvapi-...",
+        console_url="https://build.nvidia.com/settings/api-keys",
+        # Endpoints gratuitos del NVIDIA Developer Program: sin cupo de tokens,
+        # pero con 40 peticiones por minuto por cuenta. Solo modelos con tool
+        # calling comprobado en el free tier (2026-09-17). Ojo: `/v1/models`
+        # lista tambien modelos que la cuenta gratuita no puede usar (404
+        # "Function not found for account", p.ej. kimi-k2.6, nemotron-nano-3).
+        # "toggle": el razonamiento viaja en `chat_template_kwargs`.
+        models=[
+            ModelInfo("nvidia/nemotron-3-super-120b-a12b", "Nemotron 3 Super 120B", "1M",
+                      "el mas rapido en el free tier (~1 s)", thinking="toggle", recommended=True),
+            ModelInfo("z-ai/glm-5.3", "GLM-5.3", "", "~15 s por respuesta", thinking="toggle"),
+            ModelInfo("z-ai/glm-5.3-flash", "GLM-5.3 Flash", "",
+                      "cola larga en el free tier (minutos)", thinking="toggle"),
+            ModelInfo("deepseek-ai/deepseek-v4-flash-0731", "DeepSeek V4 Flash", "",
+                      "cola larga en el free tier (minutos)", thinking="toggle"),
+            ModelInfo("openai/gpt-oss-20b", "gpt-oss 20B", "128K", "razona siempre; ~1 min",
+                      thinking="always"),
+            ModelInfo("mistralai/mistral-nemotron", "Mistral Nemotron", "",
+                      "sin razonamiento; dio 500 en la prueba, sin verificar"),
         ],
     ),
     "openai_compat": ProviderInfo(

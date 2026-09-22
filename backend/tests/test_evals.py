@@ -17,7 +17,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.evals import checks  # noqa: E402
-from app.evals.simulator import build_messages, clean_output  # noqa: E402
+from app.evals.simulator import build_messages, clean_output, honors_fin  # noqa: E402
 from app.evals.spec import build_matrix, parse_suite  # noqa: E402
 from app.llm.base import LLMProvider, LLMResponse, ToolSpec, Usage  # noqa: E402
 
@@ -150,6 +150,16 @@ def test_simulator_output_cleanup() -> None:
     assert clean_output(leaked) == ("¿Y cuanto cuestan 3?", False)
 
 
+def test_fin_is_only_honored_for_real_farewells() -> None:
+    before = [("user", "hola")]
+    after = [("user", "hola"), ("agent", "Fue 24,9 %.")]
+    assert not honors_fin("¿Cual fue la pobreza en 2025?", [])  # aun no respondio
+    assert not honors_fin("Gracias", before)
+    assert not honors_fin("Gracias. ¿Podria darme tambien la fuente?", after)  # repregunta
+    assert honors_fin("Perfecto, era justo eso. Gracias.", after)
+    assert honors_fin("", after) and honors_fin("", [])  # FIN a secas siempre cierra
+
+
 def test_simulator_sees_whole_dialogue_in_one_message() -> None:
     first = build_messages("SYS", [], 1, 4)
     assert [m["role"] for m in first] == ["system", "user"]
@@ -273,5 +283,50 @@ async def _battery(tmp_path: Path) -> None:
         conv = await repo.get_conversation(result["conversation_id"])
         assert conv is not None and conv["session_id"] == job.session_id
         assert conv["metadata"]["case_id"] == "pobreza_lima_2025"
+    finally:
+        await db.close()
+
+
+class EagerFinSimulatorLLM(_Scripted):
+    """Como Nemotron: a veces cierra su primera pregunta con <<FIN>>."""
+
+    async def chat(self, messages: list[dict[str, Any]], tools: list[ToolSpec] | None = None,
+                   **kwargs: Any) -> LLMResponse:
+        first = "todavia no hay mensajes" in messages[-1]["content"]
+        text = "¿Cual fue la pobreza en Lima Metropolitana en 2025? <<FIN>>" if first else "<<FIN>>"
+        return LLMResponse(content=text, usage=Usage(10, 5, 15), latency_ms=1.0)
+
+
+def test_fin_before_any_agent_reply_is_ignored(tmp_path: Path) -> None:
+    asyncio.run(_eager_fin(tmp_path))
+
+
+async def _eager_fin(tmp_path: Path) -> None:
+    from app.evals.runner import AgentModel, EvalRequest, RoleModel, eval_manager
+    from app.llm import registry
+    from app.store import repository as repo
+    from app.store.db import db
+
+    registry.PROVIDERS.update({"s_agent": AgentLLM, "s_eager": EagerFinSimulatorLLM, "s_judge": JudgeLLM})  # type: ignore[dict-item]
+    db.path = str(tmp_path / "eager.sqlite3")
+    await db.connect()
+    try:
+        job = await eval_manager.start(
+            EvalRequest(
+                personas_yaml=PERSONAS,
+                cases_yaml=CASES,
+                agent=AgentModel(provider="s_agent", base_url="http://scripted", model="agente"),
+                simulator=RoleModel(provider="s_eager", base_url="http://scripted", model="simulador"),
+                judge=RoleModel(provider="s_judge", base_url="http://scripted", model="juez"),
+                case_ids=["pobreza_lima_2025"],
+                persona_ids=["analista_experta"],
+            )
+        )
+        [e async for e in eval_manager.stream(job, 0)]
+        result = (await repo.list_eval_results(job.id))[0]
+        # La pregunta llega al agente aunque traiga FIN; el FIN posterior cierra.
+        assert result["turns"] == 1, result
+        assert [t["role"] for t in result["transcript"]] == ["user", "agent"], result["transcript"]
+        assert "<<FIN>>" not in result["transcript"][0]["text"]
     finally:
         await db.close()

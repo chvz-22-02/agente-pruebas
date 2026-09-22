@@ -69,7 +69,8 @@ Como te comportas:
 con la informacion que conoces.
 - Cuando tu objetivo este cumplido, cuando el asistente deje claro que no puede cumplirlo o \
 cuando la conversacion no avance, despidete en una frase y termina el mensaje con {FIN}. \
-Si no tienes nada mas que decir, responde unicamente {FIN}."""
+Si no tienes nada mas que decir, responde unicamente {FIN}.
+- Si tu mensaje hace una pregunta o pide algo, NO pongas {FIN}: espera la respuesta."""
 
 
 def render_dialogue(dialogue: list[tuple[str, str]]) -> str:
@@ -87,7 +88,10 @@ def build_messages(
 ) -> list[dict[str, str]]:
     """`dialogue` es [(rol, texto)] con rol "user" (la persona) o "agent"."""
     if not dialogue:
-        task = "La conversacion empieza ahora. Escribe tu primer mensaje al asistente."
+        task = (
+            "La conversacion empieza ahora. Escribe tu primer mensaje al asistente. "
+            f"No pongas {FIN} en este mensaje: el asistente aun no ha respondido."
+        )
     else:
         task = (
             "El asistente acaba de responder. Escribe tu siguiente mensaje o, si tu objetivo ya "
@@ -105,6 +109,26 @@ def build_messages(
             ),
         },
     ]
+
+
+def honors_fin(text: str, dialogue: list[tuple[str, str]]) -> bool:
+    """Decide si una marca FIN cierra de verdad la conversacion.
+
+    Hay modelos que la ponen por tic: Nemotron 3 Super la anadia a su primera
+    pregunta y a repreguntas del tipo "¿podria indicarme...?". Cerrar ahi corta
+    la conversacion antes de que el agente responda y le suspende por algo que
+    no hizo. No cierra:
+
+    * si el agente todavia no ha respondido nunca (no hay objetivo cumplido);
+    * si el mensaje pregunta algo: una despedida no espera respuesta.
+
+    Un FIN sin texto siempre cierra, y el limite de turnos acota el resto.
+    """
+    if not text.strip():
+        return True
+    if not any(role == "agent" for role, _ in dialogue):
+        return False
+    return "?" not in text
 
 
 def clean_output(raw: str) -> tuple[str, bool]:

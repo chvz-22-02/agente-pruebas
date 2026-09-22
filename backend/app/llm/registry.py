@@ -20,7 +20,12 @@ from ..config import settings
 from .anthropic_provider import AnthropicProvider
 from .base import LLMProvider
 from .catalog import CATALOG
-from .cloud_openai_providers import GoogleProvider, OpenAIProvider
+from .cloud_openai_providers import (
+    CloudflareProvider,
+    GoogleProvider,
+    NvidiaProvider,
+    OpenAIProvider,
+)
 from .ollama_provider import OllamaProvider
 from .openai_compat_provider import OpenAICompatProvider
 
@@ -29,6 +34,8 @@ PROVIDERS: dict[str, type[LLMProvider]] = {
     "anthropic": AnthropicProvider,
     "openai": OpenAIProvider,
     "google": GoogleProvider,
+    "cloudflare": CloudflareProvider,
+    "nvidia": NvidiaProvider,
     "openai_compat": OpenAICompatProvider,
 }
 

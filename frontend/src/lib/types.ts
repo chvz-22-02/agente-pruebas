@@ -218,6 +218,8 @@ export type ProviderInfo = {
   key_env: string;
   key_hint: string;
   console_url: string;
+  /** Variable con el identificador de cuenta si la URL lo lleva (Cloudflare). */
+  account_env: string;
   supports_pull: boolean;
   models: CatalogModel[];
 };

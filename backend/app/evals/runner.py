@@ -38,7 +38,7 @@ from ..store import repository as repo
 from ..store.db import new_id
 from .checks import aggregate, deterministic_checks, judged_items
 from .judge import Judge, JudgeOutcome, render_transcript
-from .simulator import UserSimulator
+from .simulator import UserSimulator, honors_fin
 from .spec import EvalItemSpec, SuiteSpec, build_matrix, parse_suite, text_hash
 
 logger = logging.getLogger(__name__)
@@ -364,6 +364,10 @@ class EvalJob:
                 sim_usage = sim_usage.merge(sim_turn.usage)
                 sim_latency += sim_turn.latency_ms
                 text, source, closing = sim_turn.text, "simulador", sim_turn.finished
+                # FIN por tic del modelo (en la primera pregunta o en una
+                # repregunta): el mensaje se envia igualmente. Ver `honors_fin`.
+                if closing and not honors_fin(text, dialogue):
+                    closing = False
 
             if closing:
                 # La despedida se registra, pero no se le manda al agente: su
