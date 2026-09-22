@@ -107,14 +107,18 @@ class EvalAgentModel(EvalRoleModel):
 
 
 class ValidateEvalRequest(BaseModel):
-    personas_yaml: str
-    cases_yaml: str
+    """Los perfiles simulados y el banco de pruebas, tal cual estan en disco."""
+
+    personas_json: str
+    consultas_json: str
 
 
 class StartEvalRequest(BaseModel):
-    personas_yaml: str
-    cases_yaml: str
+    personas_json: str
+    consultas_json: str
     name: str = ""
+    # Nombre del banco de pruebas (p.ej. el del fichero cargado).
+    suite: str = ""
     # Experimento de MLflow; vacio => el del backend.
     mlflow_experiment: str = ""
     agent: EvalAgentModel = Field(default_factory=EvalAgentModel)
@@ -126,7 +130,9 @@ class StartEvalRequest(BaseModel):
     case_ids: list[str] = Field(default_factory=list)
     persona_ids: list[str] = Field(default_factory=list)
     repetitions: int = Field(default=1, ge=1, le=20)
-    max_turns_override: int | None = Field(default=None, ge=1, le=30)
+    # No estan en los ficheros: son ajustes de la ejecucion.
+    max_turns: int = Field(default=6, ge=1, le=30)
+    threshold: float = Field(default=0.7, ge=0, le=1)
 
 
 class ChatRequest(BaseModel):

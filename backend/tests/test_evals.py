@@ -1,4 +1,4 @@
-"""Evaluaciones: YAML, comprobaciones, agregacion y una bateria completa.
+"""Evaluaciones: ficheros JSON, comprobaciones, agregacion y una bateria completa.
 
 La bateria de extremo a extremo usa tres LLM guionizados (agente, simulador y
 evaluador) y una base SQLite temporal, asi que no necesita Ollama, ni un
@@ -10,6 +10,7 @@ servidor MCP, ni MLflow:
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -22,58 +23,77 @@ from app.evals.spec import build_matrix, parse_suite  # noqa: E402
 from app.llm.base import LLMProvider, LLMResponse, ToolSpec, Usage  # noqa: E402
 
 TEMPLATES = Path(__file__).resolve().parent.parent / "app" / "evals" / "templates"
-PERSONAS = (TEMPLATES / "personas.yaml").read_text(encoding="utf-8")
-CASES = (TEMPLATES / "casos.yaml").read_text(encoding="utf-8")
+PERSONAS = (TEMPLATES / "personas.json").read_text(encoding="utf-8")
+CASES = (TEMPLATES / "consultas.json").read_text(encoding="utf-8")
 
 
-# ---------------------------------------------------------------------- YAML -
+# ---------------------------------------------------------------------- JSON -
 def test_templates_are_valid() -> None:
     spec = parse_suite(PERSONAS, CASES)
     assert spec.ok, spec.errors
     summary = spec.summary()
-    assert [p["id"] for p in summary["personas"]] == ["analista_experta", "ciudadano_novato"]
-    assert summary["matrix"] == 4  # 2 casos x 2 personas
+    assert [p["id"] for p in summary["personas"]] == [
+        "estudiante", "ciudadano", "funcionario_junior", "funcionario_senior",
+    ]
+    # Cada consulta trae su persona: no hay producto cartesiano.
+    assert summary["matrix"] == len(summary["cases"]) == 4
 
 
-def test_yaml_errors_are_readable() -> None:
-    broken = CASES.replace("criterios:", "criterio:", 1)
+def test_json_errors_are_readable() -> None:
+    broken = CASES.replace('"valor_esperado"', '"valor-esperado"', 1)
     spec = parse_suite(PERSONAS, broken)
     assert not spec.ok
-    assert any("criterio" in e and "no reconocida" in e for e in spec.errors), spec.errors
-    # El error lleva el id del caso, no solo el indice.
-    assert any("pobreza_lima_2025" in e for e in spec.errors), spec.errors
+    assert any("valor-esperado" in e and "no reconocida" in e for e in spec.errors), spec.errors
+    # El error lleva el id de la consulta, no solo el indice.
+    assert any("PG-01" in e for e in spec.errors), spec.errors
 
-    syntax = parse_suite("personas: [\n  - id: x", CASES)
+    syntax = parse_suite(PERSONAS, '[{"id": "x",}]')
     assert not syntax.ok and any("linea" in e for e in syntax.errors), syntax.errors
+
+    shape = parse_suite("[]", CASES)
+    assert not shape.ok and any("raiz debe ser un objeto" in e for e in shape.errors), shape.errors
 
 
 def test_unknown_persona_and_duplicates() -> None:
-    cases = CASES.replace("[analista_experta, ciudadano_novato]", "[analista_experta, fantasma]")
-    spec = parse_suite(PERSONAS, cases)
-    assert any("fantasma" in e for e in spec.errors), spec.errors
+    spec = parse_suite(PERSONAS, CASES.replace('"persona": "estudiante"', '"persona": "fantasma"', 1))
+    assert any("fantasma" in e and "no existe" in e for e in spec.errors), spec.errors
 
-    dup = PERSONAS.replace("id: ciudadano_novato", "id: analista_experta")
-    spec = parse_suite(dup, CASES)
-    assert any("repetido" in e for e in spec.errors), spec.errors
+    dup = parse_suite(PERSONAS, CASES.replace('"id": "PG-02"', '"id": "PG-01"'))
+    assert any("repetido" in e for e in dup.errors), dup.errors
 
 
-def test_decimal_comma_in_expected_value() -> None:
-    spec = parse_suite(PERSONAS, CASES.replace("valor: 24.9", 'valor: "24,9"'))
+def test_ambiguity_is_normalized_and_checked() -> None:
+    spec = parse_suite(PERSONAS, CASES.replace('"ambiguedad": "alta"', '"ambiguedad": " Alta "', 1))
     assert spec.ok, spec.errors
-    assert spec.cases is not None
-    assert spec.cases.casos[0].resultado_esperado.valor == 24.9
+    assert spec.cases[0].ambiguedad == "alta"
+
+    wrong = parse_suite(PERSONAS, CASES.replace('"ambiguedad": "alta"', '"ambiguedad": "altisima"', 1))
+    assert any("ambiguedad" in e and "no permitido" in e for e in wrong.errors), wrong.errors
 
 
 def test_matrix_filters_and_turn_limits() -> None:
     spec = parse_suite(PERSONAS, CASES)
-    items = build_matrix(spec, case_ids=["pobreza_lima_2025"], repetitions=3)
-    assert len(items) == 6
-    # La persona puede fijar su propio limite (ciudadano_novato: 8).
-    by_persona = {i.persona.id: i.max_turns for i in items}
-    assert by_persona == {"analista_experta": 6, "ciudadano_novato": 8}
-    only = build_matrix(spec, persona_ids=["ciudadano_novato"], max_turns_override=2)
-    assert {i.persona.id for i in only} == {"ciudadano_novato"}
-    assert all(i.max_turns == 2 for i in only)
+    items = build_matrix(spec, case_ids=["PG-01"], repetitions=3)
+    assert len(items) == 3
+    assert all(i.max_turns == 6 and i.threshold == 0.7 for i in items)
+
+    # Filtrar por persona deja fuera las consultas que no son suyas.
+    only = build_matrix(spec, persona_ids=["estudiante"], max_turns=2, threshold=0.5)
+    assert {i.case.id for i in only} == {"PG-01", "PG-03"}
+    assert all(i.max_turns == 2 and i.threshold == 0.5 for i in only)
+
+
+def test_rubric_adapts_to_the_query() -> None:
+    from app.evals.spec import criterios_de
+
+    spec = parse_suite(PERSONAS, CASES)
+    rubric = {c.id: c for c in criterios_de(spec.cases[0])}
+    assert list(rubric) == ["resultado_esperado", "valor_esperado", "sin_invenciones", "respuesta_util"]
+    assert rubric["resultado_esperado"].obligatorio and rubric["sin_invenciones"].obligatorio
+    assert "30.0% - 33.8%" in rubric["valor_esperado"].descripcion
+
+    sin_valor = spec.cases[0].model_copy(update={"valor_esperado": ""})
+    assert "valor_esperado" not in {c.id for c in criterios_de(sin_valor)}
 
 
 # ------------------------------------------------------------- comprobaciones -
@@ -85,24 +105,29 @@ def test_numbers_spanish_and_english() -> None:
     assert checks.value_mentioned("aprox. 25%", 24.9, 0.2)[0]
 
 
-def test_deterministic_checks() -> None:
+def test_expected_numbers_from_free_text() -> None:
+    assert checks.expected_numbers("330481.79") == [330481.79]
+    assert checks.expected_numbers("863, 933, 4907") == [863, 933, 4907]
+    assert checks.expected_numbers("30.0% - 33.8% (intervalo de confianza)") == [30.0, 33.8]
+    # Un rango de anios no son dos cifras, una de ellas negativa.
+    assert checks.expected_numbers("2020-2024") == [2020, 2024]
+    assert checks.expected_numbers("empleo o mercado laboral") == []
+    assert checks.expected_numbers("No aplica") == []
+
+
+def test_deterministic_check_on_expected_value() -> None:
     spec = parse_suite(PERSONAS, CASES)
-    assert spec.cases is not None
-    case = spec.cases.casos[0].model_copy(deep=True)
-    case.herramientas.debe_usar = ["step4_get_data"]
-    case.herramientas.no_debe_usar = ["borrar_todo"]
-    case.herramientas.sin_errores = True
-    events = [
-        {"tool_name": "sirtod__step4_get_data", "real_tool_name": "step4_get_data", "ok": True},
-        {"tool_name": "step2_get_indicators", "real_tool_name": "step2_get_indicators", "ok": False,
-         "error": "timeout"},
-    ]
-    result = {c["id"]: c for c in checks.deterministic_checks(case, ["Fue 24,9%"], events)}
-    assert result["usa:step4_get_data"]["cumple"]
-    assert result["no_usa:borrar_todo"]["cumple"]
-    assert not result["sin_errores_mcp"]["cumple"]
-    assert result["max_llamadas"]["cumple"]
-    assert result["valor_mencionado"]["cumple"]
+    serie = spec.cases[0].model_copy(update={"valor_esperado": "863, 933, 4907"})
+
+    ok = checks.deterministic_checks(serie, ["Fueron 863 en 2022, 933 en 2023 y 4.907 en 2024."])
+    assert ok[0]["id"] == "valor_mencionado" and ok[0]["cumple"]
+
+    partial = checks.deterministic_checks(serie, ["Fueron 863 y 933."])
+    assert not partial[0]["cumple"] and "faltan 4907" in partial[0]["detalle"]
+
+    # Sin cifras que comprobar no se inventa ninguna comprobacion.
+    tematico = spec.cases[0].model_copy(update={"valor_esperado": "empleo o mercado laboral"})
+    assert checks.deterministic_checks(tematico, ["Hablamos de empleo."]) == []
 
 
 def test_aggregate_respects_weights_and_mandatory() -> None:
@@ -120,16 +145,16 @@ def test_aggregate_respects_weights_and_mandatory() -> None:
 
 def test_judged_items_missing_criterion_counts_as_failed() -> None:
     spec = parse_suite(PERSONAS, CASES)
-    assert spec.cases is not None
-    case = spec.cases.casos[0]
     verdict = {
-        "resultado_esperado": {"cumple": True, "justificacion": "ok"},
-        "criterios": [{"id": "ambito_correcto", "cumple": "si"}],
+        "criterios": [
+            {"id": "resultado_esperado", "cumple": "si", "justificacion": "ok"},
+            {"id": "valor_esperado", "cumple": True, "valor_reportado": "31,2 %"},
+        ]
     }
-    items = {i["id"]: i for i in checks.judged_items(case, verdict)}
+    items = {i["id"]: i for i in checks.judged_items(spec.cases[0], verdict)}
     assert items["resultado_esperado"]["cumple"]
-    assert items["ambito_correcto"]["cumple"]
-    assert not items["cita_fuente"]["cumple"] and items["cita_fuente"]["sin_juicio"]
+    assert items["valor_esperado"]["valor_reportado"] == "31,2 %"
+    assert not items["sin_invenciones"]["cumple"] and items["sin_invenciones"]["sin_juicio"]
 
 
 def test_extract_json_variants() -> None:
@@ -194,14 +219,13 @@ class _Scripted(LLMProvider):
         return {"ok": True}
 
 
+AGENT_ANSWER = "La pobreza en Ayacucho se estima entre 30,0 % y 33,8 % (fuente: INEI)."
+
+
 class AgentLLM(_Scripted):
     async def chat(self, messages: list[dict[str, Any]], tools: list[ToolSpec] | None = None,
                    **kwargs: Any) -> LLMResponse:
-        return LLMResponse(
-            content="La pobreza monetaria de Lima Metropolitana en 2025 fue de 24,9 % (fuente: INEI).",
-            usage=Usage(100, 20, 120),
-            latency_ms=5.0,
-        )
+        return LLMResponse(content=AGENT_ANSWER, usage=Usage(100, 20, 120), latency_ms=5.0)
 
 
 class SimulatorLLM(_Scripted):
@@ -209,21 +233,22 @@ class SimulatorLLM(_Scripted):
                    **kwargs: Any) -> LLMResponse:
         # El simulador recibe toda la conversacion en el ultimo mensaje.
         first = "todavia no hay mensajes" in messages[-1]["content"]
-        text = "Hola, ¿cual fue la pobreza en Lima Metropolitana en 2025?" if first else "Perfecto, gracias. <<FIN>>"
+        text = "Hola, ¿cuanta pobreza hay en Ayacucho?" if first else "Perfecto, gracias. <<FIN>>"
         return LLMResponse(content=text, usage=Usage(50, 10, 60), latency_ms=3.0)
 
 
 class JudgeLLM(_Scripted):
     async def chat(self, messages: list[dict[str, Any]], tools: list[ToolSpec] | None = None,
                    **kwargs: Any) -> LLMResponse:
-        assert "24,9 %" in messages[-1]["content"], "el evaluador no recibio la transcripcion"
+        assert AGENT_ANSWER in messages[-1]["content"], "el evaluador no recibio la transcripcion"
         return LLMResponse(
             content=(
                 "Esta es mi evaluacion:\n```json\n"
-                '{"resultado_esperado": {"cumple": true, "valor_reportado": "24,9 %", "justificacion": "Coincide."},'
-                ' "criterios": [{"id": "ambito_correcto", "cumple": true, "justificacion": "Si."},'
-                ' {"id": "cita_fuente", "cumple": true, "justificacion": "Cita al INEI."},'
-                ' {"id": "sin_invenciones", "cumple": false, "justificacion": "No uso herramientas."}],'
+                '{"criterios": ['
+                '{"id": "resultado_esperado", "cumple": true, "justificacion": "Da el intervalo."},'
+                ' {"id": "valor_esperado", "cumple": true, "valor_reportado": "30,0 % - 33,8 %"},'
+                ' {"id": "sin_invenciones", "cumple": false, "justificacion": "No uso herramientas."},'
+                ' {"id": "respuesta_util", "cumple": true, "justificacion": "Clara."}],'
                 ' "resumen": "Dato correcto pero sin respaldo de herramientas."}\n```'
             ),
             usage=Usage(400, 80, 480),
@@ -247,13 +272,12 @@ async def _battery(tmp_path: Path) -> None:
     try:
         job = await eval_manager.start(
             EvalRequest(
-                personas_yaml=PERSONAS,
-                cases_yaml=CASES,
+                personas_json=PERSONAS,
+                consultas_json=CASES,
                 agent=AgentModel(provider="s_agent", base_url="http://scripted", model="agente"),
                 simulator=RoleModel(provider="s_sim", base_url="http://scripted", model="simulador"),
                 judge=RoleModel(provider="s_judge", base_url="http://scripted", model="juez"),
-                case_ids=["pobreza_lima_2025"],
-                persona_ids=["analista_experta"],
+                case_ids=["PG-01"],
             )
         )
         events = [e async for e in eval_manager.stream(job, 0)]
@@ -270,10 +294,13 @@ async def _battery(tmp_path: Path) -> None:
         # 1 turno con el agente; la despedida con FIN no se le manda.
         assert result["turns"] == 1 and result["end_reason"] == "persona_termina", result
         assert [t["role"] for t in result["transcript"]] == ["user", "agent", "user"]
+        # El primer mensaje es el 'consulta_inicial' del fichero, no del simulador.
+        assert result["transcript"][0]["source"] == "guion"
         assert result["transcript"][-1]["closing"] is True
 
         items = {i["id"]: i for i in result["items"]}
-        assert items["valor_mencionado"]["cumple"]  # comprobacion determinista (24,9 con coma)
+        # Comprobacion determinista: 30,0 y 33,8 con coma decimal.
+        assert items["valor_mencionado"]["cumple"]
         assert not items["sin_invenciones"]["cumple"]
         # sin_invenciones es obligatorio: suspende aunque la nota pase el umbral.
         assert result["score"] > 0.7 and result["passed"] is False and result["status"] == "failed"
@@ -282,7 +309,7 @@ async def _battery(tmp_path: Path) -> None:
         # La conversacion quedo en la sesion de la evaluacion, visible en la UI.
         conv = await repo.get_conversation(result["conversation_id"])
         assert conv is not None and conv["session_id"] == job.session_id
-        assert conv["metadata"]["case_id"] == "pobreza_lima_2025"
+        assert conv["metadata"]["case_id"] == "PG-01"
     finally:
         await db.close()
 
@@ -293,7 +320,7 @@ class EagerFinSimulatorLLM(_Scripted):
     async def chat(self, messages: list[dict[str, Any]], tools: list[ToolSpec] | None = None,
                    **kwargs: Any) -> LLMResponse:
         first = "todavia no hay mensajes" in messages[-1]["content"]
-        text = "¿Cual fue la pobreza en Lima Metropolitana en 2025? <<FIN>>" if first else "<<FIN>>"
+        text = "¿Cuanta pobreza hay en Ayacucho? <<FIN>>" if first else "<<FIN>>"
         return LLMResponse(content=text, usage=Usage(10, 5, 15), latency_ms=1.0)
 
 
@@ -310,16 +337,17 @@ async def _eager_fin(tmp_path: Path) -> None:
     registry.PROVIDERS.update({"s_agent": AgentLLM, "s_eager": EagerFinSimulatorLLM, "s_judge": JudgeLLM})  # type: ignore[dict-item]
     db.path = str(tmp_path / "eager.sqlite3")
     await db.connect()
+    # Sin 'consulta_inicial' el primer mensaje lo escribe el simulador, que es
+    # donde aparece el FIN prematuro.
+    sin_guion = json.dumps([{**json.loads(CASES)[0], "consulta_inicial": ""}], ensure_ascii=False)
     try:
         job = await eval_manager.start(
             EvalRequest(
-                personas_yaml=PERSONAS,
-                cases_yaml=CASES,
+                personas_json=PERSONAS,
+                consultas_json=sin_guion,
                 agent=AgentModel(provider="s_agent", base_url="http://scripted", model="agente"),
                 simulator=RoleModel(provider="s_eager", base_url="http://scripted", model="simulador"),
                 judge=RoleModel(provider="s_judge", base_url="http://scripted", model="juez"),
-                case_ids=["pobreza_lima_2025"],
-                persona_ids=["analista_experta"],
             )
         )
         [e async for e in eval_manager.stream(job, 0)]

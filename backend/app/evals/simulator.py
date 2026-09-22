@@ -37,26 +37,37 @@ class SimTurn:
     thinking: str = ""
 
 
+# Cuanto concreta la persona al pedir las cosas. Es lo que separa una consulta
+# facil de una que obliga al agente a repreguntar.
+AMBIGUITY = {
+    "alta": (
+        "Preguntas de forma vaga: no das de entrada el ambito geografico, el periodo ni el "
+        "nombre tecnico del dato. Los concretas solo si el asistente te los pide."
+    ),
+    "media": (
+        "Dices lo esencial de lo que buscas, pero dejas algun detalle sin precisar hasta que "
+        "te lo preguntan."
+    ),
+    "baja": (
+        "Vas al grano: desde el primer mensaje dejas claro que dato quieres, de donde y de "
+        "que periodo."
+    ),
+}
+
+
 def build_system_prompt(persona: Persona, case: Case) -> str:
-    style = persona.estilo
-    behaviour = "\n".join(f"- {line}" for line in persona.comportamiento) or "- (sin indicaciones extra)"
-    context = case.contexto_persona.strip() or "(nada en particular)"
     return f"""Eres un simulador de usuarios. Interpretas a una PERSONA real que conversa por \
 chat con un asistente de IA para conseguir un OBJETIVO. Tu no eres el asistente: eres el usuario.
 
 ## Tu personaje
 Nombre: {persona.nombre}
-Descripcion: {persona.descripcion.strip() or "(sin descripcion)"}
-Tono: {style.tono} · Conocimiento del tema: {style.conocimiento} · Paciencia: {style.paciencia}
-Idioma: {style.idioma}
-Como te comportas:
-{behaviour}
+{persona.descripcion.strip() or "(sin descripcion)"}
 
 ## Tu objetivo en esta conversacion
-{case.objetivo.strip()}
+{case.goal.strip()}
 
-## Informacion que conoces (usala solo si el asistente la necesita o te la pide)
-{context}
+## Como preguntas
+{AMBIGUITY.get(case.ambiguedad, "Preguntas con naturalidad, como lo haria tu personaje.")}
 
 ## Reglas
 - Escribe SOLO tu siguiente mensaje, en primera persona. Sin comillas, sin prefijos como \

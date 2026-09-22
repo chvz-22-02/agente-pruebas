@@ -92,7 +92,7 @@ Las evaluaciones cuelgan de la misma jerarquía en vez de inventar otra:
 eval_runs ──1:1──► sessions            (metadata.kind = "evaluation")
     │
     └──1:N──► eval_results ──1:1──► conversations ──► interactions ──► tool_events
-              (caso × persona × rep.: nota, rúbrica evaluada, transcripción, métricas)
+              (consulta × repetición: nota, rúbrica evaluada, transcripción, métricas)
 ```
 
 Así todo lo que ya existía (pestaña *Trazas*, *Métricas*, exportación, borrado en cascada
@@ -108,7 +108,7 @@ con purga de MLflow) funciona igual sobre una conversación de evaluación.
 | Otro almacén | `store/db.py` y `store/repository.py` |
 | Transporte MCP por stdio | `mcpclient/connection.py::_open_transport` (`StdioServerParameters`) |
 | Otro endpoint HTTP | `api/routes_*.py` y registrarlo en `main.py` |
-| Un campo nuevo en los YAML de evaluación | `evals/spec.py` (modelo pydantic) y quien lo use: `simulator.py`, `judge.py` o `checks.py` |
+| Un campo nuevo en `personas.json` / `consultas.json` | `evals/spec.py` (modelo pydantic) y quien lo use: `simulator.py`, `judge.py` o `checks.py` |
 | Otra comprobación determinista | `evals/checks.py::deterministic_checks` (entra sola en la nota con su peso) |
 | Otro prompt de simulador o evaluador | `evals/simulator.py::build_system_prompt`, `evals/judge.py::SYSTEM_PROMPT` |
 

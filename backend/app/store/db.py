@@ -136,8 +136,8 @@ CREATE TABLE IF NOT EXISTS eval_runs (
     ended_at          REAL,
     -- Modelos, MCP y opciones. Nunca incluye claves de API.
     config            TEXT NOT NULL DEFAULT '{}',
-    personas_yaml     TEXT NOT NULL DEFAULT '',
-    cases_yaml        TEXT NOT NULL DEFAULT '',
+    personas_json     TEXT NOT NULL DEFAULT '',
+    consultas_json    TEXT NOT NULL DEFAULT '',
     summary           TEXT NOT NULL DEFAULT '{}',
     error             TEXT NOT NULL DEFAULT '',
     mlflow_experiment TEXT NOT NULL DEFAULT '',
@@ -198,6 +198,9 @@ def loads(value: str | None, fallback: Any = None) -> Any:
 # "ADD COLUMN IF NOT EXISTS", asi que se comprueba con PRAGMA table_info.
 MIGRATIONS: list[tuple[str, str, str]] = [
     ("sessions", "mlflow_experiment", "TEXT NOT NULL DEFAULT ''"),
+    # El banco de pruebas paso de dos YAML a personas.json + consultas.json.
+    ("eval_runs", "personas_json", "TEXT NOT NULL DEFAULT ''"),
+    ("eval_runs", "consultas_json", "TEXT NOT NULL DEFAULT ''"),
 ]
 
 

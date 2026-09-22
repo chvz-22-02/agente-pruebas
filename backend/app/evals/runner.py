@@ -39,7 +39,14 @@ from ..store.db import new_id
 from .checks import aggregate, deterministic_checks, judged_items
 from .judge import Judge, JudgeOutcome, render_transcript
 from .simulator import UserSimulator, honors_fin
-from .spec import EvalItemSpec, SuiteSpec, build_matrix, parse_suite, text_hash
+from .spec import (
+    DEFAULT_MAX_TURNS,
+    DEFAULT_THRESHOLD,
+    EvalItemSpec,
+    build_matrix,
+    parse_suite,
+    text_hash,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -96,32 +103,35 @@ class AgentModel(RoleModel):
 
 @dataclass
 class EvalRequest:
-    personas_yaml: str
-    cases_yaml: str
+    personas_json: str
+    consultas_json: str
     agent: AgentModel
     simulator: RoleModel
     judge: RoleModel
     mcp_conn_ids: list[str] = field(default_factory=list)
     name: str = ""
+    # Como se llama el banco de pruebas; agrupa ejecuciones en MLflow.
+    suite: str = ""
     mlflow_experiment: str = ""
     case_ids: list[str] = field(default_factory=list)
     persona_ids: list[str] = field(default_factory=list)
     repetitions: int = 1
-    max_turns_override: int | None = None
+    # Los ficheros no traen estos dos ajustes: son de la ejecucion.
+    max_turns: int = DEFAULT_MAX_TURNS
+    threshold: float = DEFAULT_THRESHOLD
 
 
 class EvalConfigError(ValueError):
-    """La peticion no se puede ejecutar (YAML invalido, matriz vacia...)."""
+    """La peticion no se puede ejecutar (JSON invalido, matriz vacia...)."""
 
 
 # ---------------------------------------------------------------- ejecucion -
 class EvalJob:
-    def __init__(self, eval_run_id: str, session_id: str, request: EvalRequest, spec: SuiteSpec,
+    def __init__(self, eval_run_id: str, session_id: str, request: EvalRequest,
                  items: list[EvalItemSpec], experiment: str, session_title: str) -> None:
         self.id = eval_run_id
         self.session_id = session_id
         self.request = request
-        self.spec = spec
         self.items = items
         self.experiment = experiment
         self.session_title = session_title
@@ -219,7 +229,7 @@ class EvalJob:
             "run_start",
             session_id=self.session_id,
             name=req.name,
-            suite=self.spec.cases.suite.nombre if self.spec.cases else "",
+            suite=req.suite,
             experiment=self.experiment,
             mcp_urls=mcp_urls,
             items=[self._item_ref(i, item) for i, item in enumerate(self.items)],
@@ -235,11 +245,7 @@ class EvalJob:
             self.session_id,
             self.session_title,
             self.experiment,
-            tags={
-                "kind": "evaluation",
-                "eval_run_id": self.id,
-                "eval_suite": self.spec.cases.suite.nombre if self.spec.cases else "",
-            },
+            tags={"kind": "evaluation", "eval_run_id": self.id, "eval_suite": req.suite},
         )
         if self.parent_run_id:
             await repo.update_eval_run(self.id, mlflow_run_id=self.parent_run_id)
@@ -247,14 +253,15 @@ class EvalJob:
                 self.parent_run_id,
                 {
                     "eval.name": req.name,
-                    "eval.suite": self.spec.cases.suite.nombre if self.spec.cases else "",
+                    "eval.suite": req.suite,
                     "eval.items": len(self.items),
                     "eval.repetitions": req.repetitions,
-                    "eval.max_turns_override": req.max_turns_override or "",
+                    "eval.max_turns": req.max_turns,
+                    "eval.threshold": req.threshold,
                     "eval.cases": ", ".join(sorted({i.case.id for i in self.items})),
                     "eval.personas": ", ".join(sorted({i.persona.id for i in self.items})),
-                    "eval.personas_sha": text_hash(req.personas_yaml),
-                    "eval.cases_sha": text_hash(req.cases_yaml),
+                    "eval.personas_sha": text_hash(req.personas_json),
+                    "eval.consultas_sha": text_hash(req.consultas_json),
                     "agent.provider": agent["provider"],
                     "agent.model": agent["model"],
                     "agent.temperature": agent["temperature"] if agent["temperature"] is not None else settings.llm_temperature,
@@ -269,9 +276,9 @@ class EvalJob:
                     "mcp_urls": ", ".join(mcp_urls) or "(ninguno)",
                 },
             )
-            # Los YAML tal cual se ejecutaron: la bateria es reproducible desde MLflow.
-            await tracker.log_text(self.parent_run_id, "evaluation/personas.yaml", req.personas_yaml)
-            await tracker.log_text(self.parent_run_id, "evaluation/casos.yaml", req.cases_yaml)
+            # Los ficheros tal cual se ejecutaron: la bateria es reproducible desde MLflow.
+            await tracker.log_text(self.parent_run_id, "evaluation/personas.json", req.personas_json)
+            await tracker.log_text(self.parent_run_id, "evaluation/consultas.json", req.consultas_json)
 
     def _item_ref(self, index: int, item: EvalItemSpec) -> dict[str, Any]:
         return {
@@ -355,8 +362,8 @@ class EvalJob:
 
             # --- mensaje de la persona ---------------------------------------
             closing = False
-            if turn == 1 and case.mensaje_inicial.strip():
-                text, source = case.mensaje_inicial.strip(), "guion"
+            if turn == 1 and case.consulta_inicial.strip():
+                text, source = case.consulta_inicial.strip(), "guion"
             else:
                 self.emit("item_phase", result_id=result_id, phase="simulando", turn=turn)
                 sim_turn = await simulator.next_message(dialogue, turn, item.max_turns)
@@ -411,7 +418,7 @@ class EvalJob:
             key=lambda e: e["created_at"],
         )
         agent_texts = [e["text"] for e in transcript if e["role"] == "agent" and e.get("text")]
-        checks = deterministic_checks(case, agent_texts, tool_events)
+        checks = deterministic_checks(case, agent_texts)
 
         judge = Judge(
             await get_provider(req.judge.provider, req.judge.base_url, req.judge.model, req.judge.api_key),
@@ -640,13 +647,13 @@ class EvalJob:
             run_id,
             {
                 "eval.case_id": case.id,
-                "eval.case_title": case.label,
+                "eval.goal": case.goal,
                 "eval.persona_id": persona.id,
                 "eval.persona_name": persona.nombre,
                 "eval.repetition": item.repetition,
                 "eval.max_turns": item.max_turns,
                 "eval.threshold": item.threshold,
-                "eval.expected_type": case.resultado_esperado.tipo,
+                "eval.ambiguedad": case.ambiguedad or "(sin indicar)",
                 "simulator.model": req.simulator.resolved()["model"],
                 "judge.model": judge_cfg["model"],
             },
@@ -766,16 +773,17 @@ class EvalJob:
                         if agg["failed_mandatory"] else ""
                     ),
                 })
-            expected = case.resultado_esperado
             await tracker.log_assessments(
                 trace_ids[-1],
                 feedbacks,
                 expectations=[{
                     "name": "resultado_esperado",
-                    "value": {k: v for k, v in expected.model_dump().items()
-                              if k in {"tipo", "descripcion", "valor", "unidad", "tolerancia"}},
+                    "value": {
+                        "resultado_esperado": case.resultado_esperado,
+                        "valor_esperado": case.valor_esperado,
+                    },
                     "source_type": "HUMAN",
-                    "source_id": "casos.yaml",
+                    "source_id": "consultas.json",
                 }],
             )
 
@@ -931,18 +939,19 @@ class EvalManager:
         return any(job.session_id == session_id and not job.finished for job in self._jobs.values())
 
     async def start(self, request: EvalRequest) -> EvalJob:
-        spec = parse_suite(request.personas_yaml, request.cases_yaml)
+        spec = parse_suite(request.personas_json, request.consultas_json)
         if not spec.ok:
-            raise EvalConfigError("; ".join(spec.errors) or "Los ficheros YAML no son validos")
+            raise EvalConfigError("; ".join(spec.errors) or "Los ficheros JSON no son validos")
         items = build_matrix(
             spec,
             case_ids=request.case_ids or None,
             persona_ids=request.persona_ids or None,
             repetitions=request.repetitions,
-            max_turns_override=request.max_turns_override,
+            max_turns=request.max_turns,
+            threshold=request.threshold,
         )
         if not items:
-            raise EvalConfigError("La seleccion no produce ninguna ejecucion (revisa casos y personas marcados)")
+            raise EvalConfigError("La seleccion no produce ninguna ejecucion (revisa consultas y personas marcadas)")
 
         # Los tres modelos se resuelven antes de arrancar: una clave que falta
         # debe fallar ahora, no a mitad de la bateria.
@@ -952,8 +961,8 @@ class EvalManager:
             except Exception as exc:  # noqa: BLE001
                 raise EvalConfigError(f"Modelo del {role}: {exc}") from exc
 
-        assert spec.cases is not None
-        suite = spec.cases.suite.nombre
+        suite = request.suite.strip() or "consultas"
+        request.suite = suite
         name = request.name.strip() or f"{suite} · {time.strftime('%d/%m %H:%M')}"
         request.name = name
         experiment = request.mlflow_experiment.strip()
@@ -974,7 +983,8 @@ class EvalManager:
             "case_ids": request.case_ids,
             "persona_ids": request.persona_ids,
             "repetitions": request.repetitions,
-            "max_turns_override": request.max_turns_override,
+            "max_turns": request.max_turns,
+            "threshold": request.threshold,
         }
         await repo.create_eval_run(
             eval_run_id,
@@ -982,12 +992,12 @@ class EvalManager:
             name=name,
             suite=suite,
             config=config,
-            personas_yaml=request.personas_yaml,
-            cases_yaml=request.cases_yaml,
+            personas_json=request.personas_json,
+            consultas_json=request.consultas_json,
             mlflow_experiment=experiment,
         )
 
-        job = EvalJob(eval_run_id, session["id"], request, spec, items, experiment, session_title)
+        job = EvalJob(eval_run_id, session["id"], request, items, experiment, session_title)
         for index, item in enumerate(items):
             await repo.create_eval_result(
                 job.result_ids[index],

@@ -1,0 +1,38 @@
+[
+  {
+    "id": "PG-01",
+    "persona": "estudiante",
+    "goal": "Obtener la tasa de pobreza de Ayacucho en el anio mas reciente disponible.",
+    "consulta_inicial": "Hola, necesito saber cuanta pobreza hay en Ayacucho para mi tesis.",
+    "ambiguedad": "alta",
+    "resultado_esperado": "Existe un valor y se devuelve correctamente a pesar de la ambiguedad",
+    "valor_esperado": "30.0% - 33.8% (intervalo de confianza)"
+  },
+  {
+    "id": "PG-02",
+    "persona": "funcionario_junior",
+    "goal": "Obtener los ingresos por financiamiento recaudados por las municipalidades del departamento de Ica en 2022.",
+    "consulta_inicial": "Necesito los ingresos por financiamiento de las municipalidades en el departamento de Ica para 2022.",
+    "ambiguedad": "baja",
+    "resultado_esperado": "Existe un valor y se devuelve correctamente",
+    "valor_esperado": "330481.79"
+  },
+  {
+    "id": "PG-03",
+    "persona": "estudiante",
+    "goal": "Intentar obtener un dato que no existe en la fuente (el precio del pan en Lima) y comprobar que el agente admite que no lo encontro en lugar de inventarlo.",
+    "consulta_inicial": "¿Puedes decirme cuanto cuesta el pan en Lima segun el gobierno?",
+    "ambiguedad": "alta",
+    "resultado_esperado": "No se encuentra disponible el valor o no existe",
+    "valor_esperado": "No aplica"
+  },
+  {
+    "id": "PG-04",
+    "persona": "funcionario_senior",
+    "goal": "Obtener los datos de la Poblacion Economicamente Activa (PEA) nacional del ultimo anio disponible.",
+    "consulta_inicial": "Dame los datos de PEA nacional del ultimo anio disponible.",
+    "ambiguedad": "baja",
+    "resultado_esperado": "Existe un valor y se devuelve correctamente",
+    "valor_esperado": "empleo o mercado laboral"
+  }
+]

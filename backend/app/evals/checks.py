@@ -2,7 +2,7 @@
 
 El reparto de responsabilidades es deliberado: el evaluador LLM solo decide,
 criterio a criterio, si se cumple o no (y por que). La nota y el aprobado los
-calcula este modulo con los pesos del YAML, de forma reproducible. Asi un
+calcula este modulo con los pesos de la rubrica, de forma reproducible. Asi un
 cambio de modelo evaluador cambia los juicios, pero nunca la aritmetica.
 """
 
@@ -12,7 +12,7 @@ import json
 import re
 from typing import Any
 
-from .spec import Case
+from .spec import Case, criterios_de
 
 NUMBER_TOKEN = re.compile(r"-?\d[\d.,]*\d|-?\d")
 THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
@@ -58,15 +58,28 @@ def value_mentioned(text: str, expected: float, tolerance: float) -> tuple[bool,
     return ok, closest
 
 
-# ------------------------------------------------------------ herramientas --
-def _tool_matches(event: dict[str, Any], wanted: str) -> bool:
-    """Coincide con el nombre expuesto, el real o el prefijado por servidor."""
-    target = wanted.strip().lower()
-    names = {
-        (event.get("tool_name") or "").lower(),
-        (event.get("real_tool_name") or "").lower(),
-    }
-    return target in names or any(n.endswith(f"__{target}") for n in names)
+def expected_numbers(text: str) -> list[float]:
+    """Cifras de un ``valor_esperado`` escrito en texto libre.
+
+    Lo que hay en el banco de pruebas va del dato suelto (``30646``) a la serie
+    (``863, 933, 4907``), el rango (``30.0% - 33.8%``) o ninguna cifra en
+    absoluto (``empleo o mercado laboral``, ``No aplica``). Aqui se lee el
+    fichero, no la respuesta del agente, asi que se toma la lectura literal:
+    punto decimal y nada de separadores de miles.
+    """
+    values: list[float] = []
+    for match in NUMBER_TOKEN.finditer(text or ""):
+        token = match.group().strip(".,")
+        # En "2020-2024" el guion separa un rango, no marca un negativo.
+        if token.startswith("-") and match.start() and text[match.start() - 1].isdigit():
+            token = token[1:]
+        try:
+            value = float(token)
+        except ValueError:
+            continue
+        if value not in values:
+            values.append(value)
+    return values
 
 
 def _check(
@@ -83,94 +96,34 @@ def _check(
     }
 
 
-def deterministic_checks(
-    case: Case, agent_texts: list[str], tool_events: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """Verificaciones que no necesitan a ningun LLM."""
-    checks: list[dict[str, Any]] = []
-    expected = case.resultado_esperado
-    tools = case.herramientas
+def deterministic_checks(case: Case, agent_texts: list[str]) -> list[dict[str, Any]]:
+    """Verificaciones que no necesitan a ningun LLM.
+
+    Solo hay una, y solo cuando el ``valor_esperado`` de la consulta trae
+    cifras: que esas cifras aparezcan en lo que respondio el agente. El resto
+    del ``valor_esperado`` (un ambito tematico, un "No aplica") no se puede
+    comprobar con una expresion regular y lo juzga el evaluador.
+    """
+    expected = expected_numbers(case.valor_esperado)
+    if not expected:
+        return []
     answers = "\n".join(agent_texts)
-    lowered = answers.lower()
-    used = sorted({e.get("tool_name", "") for e in tool_events})
-
-    for name in tools.debe_usar:
-        hits = [e for e in tool_events if _tool_matches(e, name)]
-        checks.append(
-            _check(
-                f"usa:{name}",
-                f"Usa la herramienta '{name}'",
-                bool(hits),
-                f"{len(hits)} llamada(s)" if hits else f"no se llamo; usadas: {', '.join(used) or 'ninguna'}",
-            )
+    missing = [value for value in expected if not value_mentioned(answers, value, 0.0)[0]]
+    listed = ", ".join(f"{value:g}" for value in expected)
+    return [
+        _check(
+            "valor_mencionado",
+            f"Las respuestas mencionan {listed}",
+            not missing,
+            f"{len(expected) - len(missing)} de {len(expected)}"
+            + (f"; faltan {', '.join(f'{v:g}' for v in missing)}" if missing else ""),
         )
-    for name in tools.no_debe_usar:
-        hits = [e for e in tool_events if _tool_matches(e, name)]
-        checks.append(
-            _check(
-                f"no_usa:{name}",
-                f"No usa la herramienta '{name}'",
-                not hits,
-                f"se llamo {len(hits)} vez/veces" if hits else "no se llamo",
-            )
-        )
-    if tools.max_llamadas is not None:
-        checks.append(
-            _check(
-                "max_llamadas",
-                f"Como mucho {tools.max_llamadas} llamadas al MCP",
-                len(tool_events) <= tools.max_llamadas,
-                f"{len(tool_events)} llamadas",
-            )
-        )
-    if tools.sin_errores:
-        failed = [e for e in tool_events if not e.get("ok", True)]
-        checks.append(
-            _check(
-                "sin_errores_mcp",
-                "Ninguna llamada al MCP devuelve error",
-                not failed,
-                "; ".join(f"{e.get('tool_name')}: {(e.get('error') or '')[:120]}" for e in failed[:3])
-                or "sin errores",
-            )
-        )
-
-    if expected.tipo == "valor" and isinstance(expected.valor, float):
-        ok, closest = value_mentioned(answers, expected.valor, expected.tolerancia)
-        checks.append(
-            _check(
-                "valor_mencionado",
-                f"La respuesta menciona {expected.valor:g}{expected.unidad and ' ' + expected.unidad}"
-                + (f" (±{expected.tolerancia:g})" if expected.tolerancia else ""),
-                ok,
-                f"cifra mas cercana en las respuestas: {closest:g}" if closest is not None
-                else "no hay cifras en las respuestas",
-            )
-        )
-    if expected.tipo == "texto" and isinstance(expected.valor, str) and expected.valor.strip():
-        ok = expected.valor.strip().lower() in lowered
-        checks.append(
-            _check("texto_mencionado", f"La respuesta contiene '{expected.valor}'", ok,
-                   "encontrado" if ok else "no encontrado")
-        )
-    for fragment in expected.debe_contener:
-        ok = fragment.lower() in lowered
-        checks.append(
-            _check(f"contiene:{fragment}", f"La respuesta contiene '{fragment}'", ok,
-                   "encontrado" if ok else "no encontrado")
-        )
-    for fragment in expected.no_debe_contener:
-        ok = fragment.lower() not in lowered
-        checks.append(
-            _check(f"no_contiene:{fragment}", f"La respuesta no contiene '{fragment}'", ok,
-                   "ausente" if ok else "aparece en la respuesta")
-        )
-    return checks
+    ]
 
 
 # --------------------------------------------------------------- agregacion --
 def judged_items(case: Case, verdict: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """Cruza la rubrica del YAML con lo que dijo el evaluador.
+    """Cruza la rubrica de la consulta con lo que dijo el evaluador.
 
     Un criterio sobre el que el evaluador no se pronuncia cuenta como no
     cumplido: es la lectura conservadora, y se marca para que se vea.
@@ -180,24 +133,8 @@ def judged_items(case: Case, verdict: dict[str, Any] | None) -> list[dict[str, A
     by_id = {
         str(item.get("id")): item for item in raw_criteria if isinstance(item, dict) and item.get("id")
     }
-    expected = case.resultado_esperado
     items: list[dict[str, Any]] = []
-
-    judged = verdict.get("resultado_esperado") if isinstance(verdict.get("resultado_esperado"), dict) else None
-    items.append(
-        {
-            "id": "resultado_esperado",
-            "origen": "evaluador",
-            "descripcion": expected.descripcion,
-            "cumple": _truthy(judged.get("cumple")) if judged else False,
-            "detalle": (judged or {}).get("justificacion") or "El evaluador no se pronuncio",
-            "valor_reportado": (judged or {}).get("valor_reportado"),
-            "peso": expected.peso,
-            "obligatorio": expected.obligatorio,
-            "sin_juicio": judged is None,
-        }
-    )
-    for criterion in case.criterios:
+    for criterion in criterios_de(case):
         item = by_id.get(criterion.id)
         items.append(
             {
@@ -206,6 +143,7 @@ def judged_items(case: Case, verdict: dict[str, Any] | None) -> list[dict[str, A
                 "descripcion": criterion.descripcion,
                 "cumple": _truthy(item.get("cumple")) if item else False,
                 "detalle": (item or {}).get("justificacion") or "El evaluador no se pronuncio",
+                "valor_reportado": (item or {}).get("valor_reportado"),
                 "peso": criterion.peso,
                 "obligatorio": criterion.obligatorio,
                 "sin_juicio": item is None,

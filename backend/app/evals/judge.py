@@ -1,4 +1,4 @@
-"""Evaluador LLM: juzga la conversacion terminada contra la rubrica del caso.
+"""Evaluador LLM: juzga la conversacion terminada contra la rubrica de la consulta.
 
 Recibe la transcripcion completa, incluidas las llamadas al MCP con sus
 resultados (recortados para caber en la ventana de un modelo local), y las
@@ -14,7 +14,7 @@ from typing import Any
 
 from ..llm.base import LLMProvider, Usage
 from .checks import extract_json
-from .spec import Case, Persona
+from .spec import Case, Persona, criterios_de
 
 # Presupuesto de caracteres del material que se le pasa al evaluador. Con
 # num_ctx=16384 un modelo local tiene ~50k caracteres de ventana; se deja sitio
@@ -23,27 +23,30 @@ MAX_TOOL_RESULT_CHARS = 2500
 MAX_TRANSCRIPT_CHARS = 36000
 
 SYSTEM_PROMPT = """Eres un evaluador imparcial y exigente de agentes conversacionales \
-conectados a herramientas (servidores MCP). Recibes un caso de prueba, el resultado esperado, \
-una rubrica de criterios, la transcripcion completa de la conversacion (con las llamadas a \
-herramientas y lo que devolvieron) y unas verificaciones automaticas ya calculadas.
+conectados a herramientas (servidores MCP). Recibes una consulta del banco de pruebas, lo que \
+se esperaba de ella, una rubrica de criterios, la transcripcion completa de la conversacion \
+(con las llamadas a herramientas y lo que devolvieron) y unas verificaciones automaticas ya \
+calculadas.
 
 Como evaluas:
 - Juzga SOLO con la evidencia de la transcripcion. Si algo no aparece, no lo supongas.
-- Un dato es correcto si el agente lo afirma y coincide con lo esperado. Si el agente da una \
-cifra que no esta respaldada por ninguna herramienta, considerala inventada.
-- Si lo esperado es que el dato NO exista, el agente cumple solo si lo dice con claridad y \
-no inventa un valor.
+- Un dato es correcto si el agente lo afirma y se corresponde con lo esperado. Si el agente da \
+una cifra que no esta respaldada por ninguna herramienta, considerala inventada.
+- El valor esperado esta escrito en lenguaje natural: puede ser una cifra, una serie de cifras, \
+un rango o un ambito tematico. Si dice que no aplica o que el dato no existe, el agente cumple \
+solo si dice con claridad que no lo encontro y no inventa ningun valor.
 - Las verificaciones automaticas son hechos; usalas como evidencia.
 - Se breve y concreto en las justificaciones.
 
 Responde UNICAMENTE con un objeto JSON valido, sin texto antes ni despues y sin bloques de \
 codigo, con exactamente esta forma:
 {
-  "resultado_esperado": {"cumple": true, "valor_reportado": "<lo que afirmo el agente o null>", "justificacion": "<1-3 frases>"},
   "criterios": [{"id": "<id del criterio>", "cumple": true, "justificacion": "<1-2 frases>"}],
   "resumen": "<2-4 frases con la valoracion global>"
 }
-En "criterios" incluye exactamente un elemento por cada criterio de la rubrica, con su mismo id."""
+Incluye exactamente un elemento por cada criterio de la rubrica, con su mismo id. En el \
+criterio "valor_esperado" anade ademas "valor_reportado" con el dato que afirmo el agente \
+(o null si no dio ninguno)."""
 
 REPAIR_PROMPT = """Tu respuesta anterior no era un JSON valido. Devuelve ahora SOLO el objeto \
 JSON con la forma pedida, sin texto adicional."""
@@ -99,26 +102,19 @@ def render_transcript(transcript: list[dict[str, Any]]) -> str:
 def build_user_prompt(
     case: Case, persona: Persona, transcript: list[dict[str, Any]], checks: list[dict[str, Any]]
 ) -> str:
-    expected = case.resultado_esperado
-    expected_lines = [f"Tipo: {expected.tipo}", f"Descripcion: {expected.descripcion.strip()}"]
-    if expected.valor is not None:
-        value = f"{expected.valor:g}" if isinstance(expected.valor, float) else str(expected.valor)
-        expected_lines.append(f"Valor: {value} {expected.unidad}".rstrip())
-        if expected.tolerancia:
-            expected_lines.append(f"Tolerancia: ±{expected.tolerancia:g}")
-
-    rubric = "\n".join(f"- {c.id}: {c.descripcion.strip()}" for c in case.criterios) or "(sin criterios adicionales)"
+    rubric = "\n".join(f"- {c.id}: {c.descripcion.strip()}" for c in criterios_de(case))
     auto = "\n".join(
         f"- [{'CUMPLE' if c['cumple'] else 'NO CUMPLE'}] {c['descripcion']} ({c['detalle']})"
         for c in checks
     ) or "(ninguna)"
 
-    return f"""## Caso: {case.label}
-Objetivo del usuario: {case.objetivo.strip()}
+    return f"""## Consulta: {case.id}
+Objetivo del usuario: {case.goal.strip()}
 Usuario simulado: {persona.nombre}
 
-## Resultado esperado
-{chr(10).join(expected_lines)}
+## Lo que se esperaba
+Resultado: {case.resultado_esperado.strip() or "(no se indica)"}
+Valor: {case.valor_esperado.strip() or "(no se indica)"}
 
 ## Rubrica (criterios a juzgar)
 {rubric}

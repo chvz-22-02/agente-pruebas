@@ -371,8 +371,8 @@ hr.sep { border: none; border-top: 1px solid var(--line); margin: 14px 0; }
   color: var(--fg-dim);
   margin-bottom: 8px;
 }
-.eval-yaml-tabs { border: 1px solid var(--line); border-radius: 6px 6px 0 0; }
-.yaml-editor {
+.eval-file-tabs { border: 1px solid var(--line); border-radius: 6px 6px 0 0; }
+.file-editor {
   font-family: var(--mono);
   font-size: 12px;
   line-height: 1.45;
