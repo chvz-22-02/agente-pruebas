@@ -1,158 +1,134 @@
-"""Estructura de los ficheros YAML de evaluacion y su validacion.
+"""Estructura de los ficheros JSON de evaluacion y su validacion.
 
 Hay dos ficheros independientes, para poder combinar el mismo juego de
-personas con distintas baterias de casos (y al reves):
+personas con distintos bancos de consultas (y al reves):
 
-* ``personas.yaml``: los usuarios que el simulador debe interpretar.
-* ``casos.yaml``:    las casuisticas a evaluar, con su resultado esperado, la
-  rubrica para el evaluador LLM y las comprobaciones deterministas.
+* ``personas.json``:  los perfiles que interpreta el simulador, indexados por
+  su identificador.
+* ``consultas.json``: el banco de pruebas. Cada consulta nombra a la persona
+  que la formula, su objetivo, el primer mensaje y lo que deberia salir.
 
 Los modelos rechazan claves desconocidas (``extra="forbid"``) a proposito: en
-un YAML escrito a mano, ``criterio:`` en lugar de ``criterios:`` no debe pasar
-en silencio y dejar el caso sin rubrica.
+un fichero escrito a mano, ``valor-esperado`` en lugar de ``valor_esperado`` no
+debe pasar en silencio y dejar la consulta sin dato que comprobar.
+
+La rubrica no viaja en los ficheros: es la misma para todo el banco y vive en
+``CRITERIOS`` / ``criterios_de``.
 """
 
 from __future__ import annotations
 
 import hashlib
-import re
+import json
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 ID_PATTERN = r"^[A-Za-z0-9_.-]+$"
 MAX_TURNS_LIMIT = 30
+DEFAULT_MAX_TURNS = 6
+DEFAULT_THRESHOLD = 0.7
 
 
 class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-def _to_number(value: Any) -> Any:
-    """Acepta ``24,9`` ademas de ``24.9``: el YAML lo escriben personas."""
-    if isinstance(value, str):
-        text = value.strip().replace(" ", "")
-        if re.fullmatch(r"-?\d+(,\d+)?", text):
-            return float(text.replace(",", "."))
-        if re.fullmatch(r"-?\d+(\.\d+)?", text):
-            return float(text)
-    return value
-
-
 # ------------------------------------------------------------------ personas -
-class PersonaStyle(_Strict):
-    tono: str = "neutral"
-    conocimiento: str = "intermedio"
-    paciencia: str = "media"
-    idioma: str = "es"
-
-
 class Persona(_Strict):
+    """Un perfil de ``personas.json``; el ``id`` es la clave del objeto."""
+
     id: str = Field(pattern=ID_PATTERN)
     nombre: str
+    # Quien es, que sabe y como conversa: va tal cual al prompt del simulador.
     descripcion: str = ""
-    estilo: PersonaStyle = Field(default_factory=PersonaStyle)
-    # Instrucciones libres para el simulador, una por linea.
-    comportamiento: list[str] = Field(default_factory=list)
-    # Sobrescribe el limite de turnos del caso para esta persona.
-    max_turnos: int | None = Field(default=None, ge=1, le=MAX_TURNS_LIMIT)
 
 
-class PersonasFile(_Strict):
-    version: int = 1
-    personas: list[Persona] = Field(min_length=1)
-
-
-# --------------------------------------------------------------------- casos -
-ExpectedType = Literal["valor", "no_existe", "error_controlado", "texto", "libre"]
-
-
-class ExpectedResult(_Strict):
-    """Lo que el agente deberia acabar respondiendo.
-
-    * ``valor``:            una cifra concreta (``valor`` + ``tolerancia``).
-    * ``no_existe``:        el dato no existe para lo pedido; no debe inventarlo.
-    * ``error_controlado``: la peticion es invalida y debe explicarlo.
-    * ``texto``:            una respuesta textual concreta (``valor`` como texto).
-    * ``libre``:            solo la ``descripcion``; el evaluador juzga.
-    """
-
-    tipo: ExpectedType = "libre"
-    descripcion: str
-    valor: float | str | None = None
-    unidad: str = ""
-    # Diferencia absoluta admitida al buscar la cifra en la respuesta.
-    tolerancia: float = Field(default=0.0, ge=0)
-    # Comprobaciones literales (sin distinguir mayusculas) sobre las respuestas.
-    debe_contener: list[str] = Field(default_factory=list)
-    no_debe_contener: list[str] = Field(default_factory=list)
-    peso: float = Field(default=3.0, ge=0)
-    # Si no se cumple, el caso falla aunque la puntuacion supere el umbral.
-    obligatorio: bool = True
-
-    @field_validator("valor", mode="before")
-    @classmethod
-    def coerce_valor(cls, value: Any) -> Any:
-        return _to_number(value)
-
-
-class Criterion(_Strict):
-    id: str = Field(pattern=ID_PATTERN)
-    descripcion: str
-    peso: float = Field(default=1.0, ge=0)
-    obligatorio: bool = False
-
-
-class ToolExpectations(_Strict):
-    debe_usar: list[str] = Field(default_factory=list)
-    no_debe_usar: list[str] = Field(default_factory=list)
-    max_llamadas: int | None = Field(default=None, ge=0)
-    # Falla si alguna llamada al MCP devolvio error.
-    sin_errores: bool = False
+# ----------------------------------------------------------------- consultas -
+Ambiguity = Literal["alta", "media", "baja", ""]
 
 
 class Case(_Strict):
+    """Una consulta del banco de pruebas."""
+
     id: str = Field(pattern=ID_PATTERN)
-    titulo: str = ""
-    # Lo que la persona quiere conseguir. Se le da al simulador, no al agente.
-    objetivo: str
+    # Quien la formula; tiene que existir en personas.json.
+    persona: str
+    # Lo que la persona quiere conseguir. Lo recibe el simulador, no el agente.
+    goal: str
     # Primer mensaje literal. Vacio => lo redacta el simulador.
-    mensaje_inicial: str = ""
-    # Datos que la persona conoce y usa solo si el agente se los pide.
-    contexto_persona: str = ""
-    # Personas que ejecutan el caso. Vacio => las de `defaults.personas`.
-    personas: list[str] = Field(default_factory=list)
-    max_turnos: int | None = Field(default=None, ge=1, le=MAX_TURNS_LIMIT)
-    resultado_esperado: ExpectedResult
-    criterios: list[Criterion] = Field(default_factory=list)
-    herramientas: ToolExpectations = Field(default_factory=ToolExpectations)
-    umbral: float | None = Field(default=None, ge=0, le=1)
-    etiquetas: list[str] = Field(default_factory=list)
+    consulta_inicial: str = ""
+    # Cuanto concreta la persona al preguntar; modula el prompt del simulador.
+    ambiguedad: Ambiguity = ""
+    # Que deberia ocurrir, en texto libre ("Existe un valor y se devuelve...").
+    resultado_esperado: str = ""
+    # El dato esperado, en texto libre: una cifra, una serie, un rango, un
+    # ambito tematico, o "No aplica" cuando no deberia existir.
+    valor_esperado: str = ""
+
+    @field_validator("ambiguedad", mode="before")
+    @classmethod
+    def normalize_ambiguity(cls, value: Any) -> Any:
+        return value.strip().lower() if isinstance(value, str) else value
 
     @property
     def label(self) -> str:
-        return self.titulo or self.id
+        return self.id
 
 
-class SuiteInfo(_Strict):
-    nombre: str = "suite sin nombre"
-    descripcion: str = ""
+# ------------------------------------------------------------------ rubrica --
+class Criterion(BaseModel):
+    id: str
+    descripcion: str
+    peso: float = 1.0
+    # Si no se cumple, el caso suspende aunque la nota llegue al umbral.
+    obligatorio: bool = False
 
 
-class CaseDefaults(_Strict):
-    max_turnos: int = Field(default=6, ge=1, le=MAX_TURNS_LIMIT)
-    # Vacio => todas las personas del fichero de personas.
-    personas: list[str] = Field(default_factory=list)
-    umbral_aprobacion: float = Field(default=0.7, ge=0, le=1)
+# Los criterios que no dependen de la consulta. La nota es la suma de los pesos
+# cumplidos entre la suma de los pesos, asi que el peso es lo que gradua cuanto
+# cuenta cada cosa.
+CRITERIOS = [
+    Criterion(
+        id="sin_invenciones",
+        descripcion=(
+            "Toda cifra o dato que el agente afirma esta respaldado por el resultado de una "
+            "herramienta del MCP: no rellena huecos con conocimiento propio."
+        ),
+        peso=2.0,
+        obligatorio=True,
+    ),
+    Criterion(
+        id="respuesta_util",
+        descripcion=(
+            "La respuesta contesta a lo que pide la persona y esta redactada a su nivel, "
+            "sin dejarla con el trabajo a medias."
+        ),
+        peso=1.0,
+    ),
+]
 
 
-class CasesFile(_Strict):
-    version: int = 1
-    suite: SuiteInfo = Field(default_factory=SuiteInfo)
-    defaults: CaseDefaults = Field(default_factory=CaseDefaults)
-    casos: list[Case] = Field(min_length=1)
+def criterios_de(case: Case) -> list[Criterion]:
+    """Rubrica de una consulta: lo suyo primero, y despues los criterios fijos."""
+    rubric = [
+        Criterion(
+            id="resultado_esperado",
+            descripcion=case.resultado_esperado.strip() or "El agente consigue lo que la persona buscaba.",
+            peso=3.0,
+            obligatorio=True,
+        )
+    ]
+    if case.valor_esperado.strip():
+        rubric.append(
+            Criterion(
+                id="valor_esperado",
+                descripcion=f"El dato que da el agente se corresponde con: {case.valor_esperado.strip()}",
+                peso=3.0,
+            )
+        )
+    return rubric + CRITERIOS
 
 
 # --------------------------------------------------------------- resultado ---
@@ -163,32 +139,28 @@ class SuiteSpec:
     ok: bool
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
-    personas: PersonasFile | None = None
-    cases: CasesFile | None = None
+    personas: list[Persona] = field(default_factory=list)
+    cases: list[Case] = field(default_factory=list)
 
     def summary(self) -> dict[str, Any]:
-        personas = self.personas.personas if self.personas else []
-        cases = self.cases.casos if self.cases else []
         return {
             "ok": self.ok,
             "errors": self.errors,
             "warnings": self.warnings,
-            "suite": self.cases.suite.model_dump() if self.cases else None,
-            "defaults": self.cases.defaults.model_dump() if self.cases else None,
             "personas": [
-                {"id": p.id, "nombre": p.nombre, "descripcion": p.descripcion} for p in personas
+                {"id": p.id, "nombre": p.nombre, "descripcion": p.descripcion} for p in self.personas
             ],
             "cases": [
                 {
                     "id": c.id,
-                    "titulo": c.label,
-                    "objetivo": c.objetivo,
-                    "tipo": c.resultado_esperado.tipo,
-                    "personas": personas_for_case(self, c),
-                    "criterios": len(c.criterios),
-                    "etiquetas": c.etiquetas,
+                    "persona": c.persona,
+                    "goal": c.goal,
+                    "consulta_inicial": c.consulta_inicial,
+                    "ambiguedad": c.ambiguedad,
+                    "resultado_esperado": c.resultado_esperado,
+                    "valor_esperado": c.valor_esperado,
                 }
-                for c in cases
+                for c in self.cases
             ],
             "matrix": len(build_matrix(self)) if self.ok else 0,
         }
@@ -196,7 +168,7 @@ class SuiteSpec:
 
 @dataclass
 class EvalItemSpec:
-    """Una ejecucion concreta: un caso, con una persona, en una repeticion."""
+    """Una ejecucion concreta: una consulta, con su persona, en una repeticion."""
 
     case: Case
     persona: Persona
@@ -210,60 +182,78 @@ _MESSAGES = {
     "missing": "campo obligatorio",
     "extra_forbidden": "clave no reconocida (¿error de escritura?)",
     "string_pattern_mismatch": "solo se admiten letras, numeros y los simbolos _ . -",
-    "too_short": "no puede estar vacio",
     "string_type": "debe ser texto",
     "list_type": "debe ser una lista",
     "int_parsing": "debe ser un numero entero",
     "float_parsing": "debe ser un numero",
     "bool_parsing": "debe ser true o false",
-    "greater_than_equal": "valor demasiado pequeño",
-    "less_than_equal": "valor demasiado grande",
 }
 
 
-def _loc(loc: tuple[Any, ...], raw: Any) -> str:
-    """``('casos', 0, 'tipo')`` -> ``casos[0] (id_del_caso).tipo``."""
-    parts: list[str] = []
-    node = raw
-    for item in loc:
-        if isinstance(item, int):
-            label = f"[{item}]"
-            try:
-                node = node[item]
-                if isinstance(node, dict) and node.get("id"):
-                    label += f" ({node['id']})"
-            except (IndexError, KeyError, TypeError):
-                node = None
-            parts.append(label)
-        else:
-            parts.append(("." if parts else "") + str(item))
-            node = node.get(item) if isinstance(node, dict) else None
-    return "".join(parts) or "(raiz)"
-
-
-def _format_validation(exc: ValidationError, raw: Any, source: str) -> list[str]:
+def _describe(exc: ValidationError, source: str) -> list[str]:
     out = []
     for err in exc.errors():
+        field_path = ".".join(str(part) for part in err["loc"])
         message = _MESSAGES.get(err["type"])
         if err["type"] == "literal_error":
             expected = err.get("ctx", {}).get("expected", "")
             message = f"valor no permitido; usa uno de: {expected}"
-        out.append(f"{source} · {_loc(err['loc'], raw)}: {message or err['msg']}")
+        out.append(f"{source}{'.' + field_path if field_path else ''}: {message or err['msg']}")
     return out
 
 
-def _load_yaml(text: str, source: str, errors: list[str]) -> Any:
+def _load_json(text: str, source: str, errors: list[str]) -> Any:
     if not text or not text.strip():
         errors.append(f"{source}: el fichero esta vacio")
         return None
     try:
-        return yaml.safe_load(text)
-    except yaml.YAMLError as exc:
-        mark = getattr(exc, "problem_mark", None)
-        where = f" (linea {mark.line + 1}, columna {mark.column + 1})" if mark else ""
-        problem = getattr(exc, "problem", None) or str(exc)
-        errors.append(f"{source}: YAML invalido{where}: {problem}")
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        errors.append(f"{source}: JSON invalido (linea {exc.lineno}, columna {exc.colno}): {exc.msg}")
         return None
+
+
+def _parse_personas(raw: Any, errors: list[str]) -> list[Persona]:
+    if not isinstance(raw, dict):
+        errors.append('personas.json: la raiz debe ser un objeto {"id_de_persona": {...}}')
+        return []
+    if not raw:
+        errors.append("personas.json: no hay ninguna persona")
+        return []
+    personas: list[Persona] = []
+    for key, value in raw.items():
+        source = f"personas.json · {key}"
+        if not isinstance(value, dict):
+            errors.append(f"{source}: debe ser un objeto con 'nombre' y 'descripcion'")
+            continue
+        try:
+            # La clave manda sobre un 'id' escrito dentro por despiste.
+            personas.append(Persona.model_validate({**value, "id": key}))
+        except ValidationError as exc:
+            errors.extend(_describe(exc, source))
+    return personas
+
+
+def _parse_cases(raw: Any, errors: list[str]) -> list[Case]:
+    if not isinstance(raw, list):
+        errors.append("consultas.json: la raiz debe ser una lista de consultas")
+        return []
+    if not raw:
+        errors.append("consultas.json: no hay ninguna consulta")
+        return []
+    cases: list[Case] = []
+    for index, value in enumerate(raw):
+        if not isinstance(value, dict):
+            errors.append(f"consultas.json · [{index}]: debe ser un objeto")
+            continue
+        source = f"consultas.json · [{index}]"
+        if value.get("id"):
+            source += f" ({value['id']})"
+        try:
+            cases.append(Case.model_validate(value))
+        except ValidationError as exc:
+            errors.extend(_describe(exc, source))
+    return cases
 
 
 def _duplicates(ids: list[str]) -> list[str]:
@@ -276,75 +266,36 @@ def _duplicates(ids: list[str]) -> list[str]:
 
 
 # -------------------------------------------------------------- validacion --
-def parse_suite(personas_yaml: str, cases_yaml: str) -> SuiteSpec:
+def parse_suite(personas_json: str, consultas_json: str) -> SuiteSpec:
     errors: list[str] = []
     warnings: list[str] = []
 
-    raw_personas = _load_yaml(personas_yaml, "personas.yaml", errors)
-    raw_cases = _load_yaml(cases_yaml, "casos.yaml", errors)
+    raw_personas = _load_json(personas_json, "personas.json", errors)
+    raw_cases = _load_json(consultas_json, "consultas.json", errors)
 
-    personas: PersonasFile | None = None
-    cases: CasesFile | None = None
+    personas = _parse_personas(raw_personas, errors) if raw_personas is not None else []
+    cases = _parse_cases(raw_cases, errors) if raw_cases is not None else []
 
-    if raw_personas is not None:
-        if not isinstance(raw_personas, dict):
-            errors.append("personas.yaml: la raiz debe ser un mapa con la clave 'personas'")
-        else:
-            try:
-                personas = PersonasFile.model_validate(raw_personas)
-            except ValidationError as exc:
-                errors.extend(_format_validation(exc, raw_personas, "personas.yaml"))
+    for dup in _duplicates([c.id for c in cases]):
+        errors.append(f"consultas.json: el id de consulta '{dup}' esta repetido")
 
-    if raw_cases is not None:
-        if not isinstance(raw_cases, dict):
-            errors.append("casos.yaml: la raiz debe ser un mapa con la clave 'casos'")
-        else:
-            try:
-                cases = CasesFile.model_validate(raw_cases)
-            except ValidationError as exc:
-                errors.extend(_format_validation(exc, raw_cases, "casos.yaml"))
-
-    if personas:
-        for dup in _duplicates([p.id for p in personas.personas]):
-            errors.append(f"personas.yaml: el id de persona '{dup}' esta repetido")
-
-    if cases:
-        for dup in _duplicates([c.id for c in cases.casos]):
-            errors.append(f"casos.yaml: el id de caso '{dup}' esta repetido")
-        for case in cases.casos:
-            for dup in _duplicates([c.id for c in case.criterios]):
-                errors.append(f"casos.yaml · {case.id}: el criterio '{dup}' esta repetido")
-            if "resultado_esperado" in {c.id for c in case.criterios}:
-                errors.append(
-                    f"casos.yaml · {case.id}: 'resultado_esperado' es un id reservado para criterios"
-                )
-            expected = case.resultado_esperado
-            if expected.tipo in {"valor", "texto"} and expected.valor is None:
-                warnings.append(
-                    f"casos.yaml · {case.id}: tipo '{expected.tipo}' sin 'valor'; "
-                    "solo se juzgara con la descripcion"
-                )
-            if expected.tolerancia and not isinstance(expected.valor, float):
-                warnings.append(
-                    f"casos.yaml · {case.id}: 'tolerancia' solo aplica a valores numericos"
-                )
-            if not case.criterios:
-                warnings.append(
-                    f"casos.yaml · {case.id}: sin 'criterios'; se evaluara solo el resultado esperado"
-                )
-
-    if personas and cases:
-        known = {p.id for p in personas.personas}
-        for pid in cases.defaults.personas:
-            if pid not in known:
-                errors.append(f"casos.yaml · defaults.personas: la persona '{pid}' no existe")
-        for case in cases.casos:
-            for pid in case.personas:
-                if pid not in known:
-                    errors.append(f"casos.yaml · {case.id}: la persona '{pid}' no existe")
+    known = {p.id for p in personas}
+    for case in cases:
+        if personas and case.persona not in known:
+            errors.append(
+                f"consultas.json · {case.id}: la persona '{case.persona}' no existe en personas.json"
+            )
+        if not case.resultado_esperado.strip():
+            warnings.append(
+                f"consultas.json · {case.id}: sin 'resultado_esperado'; el evaluador solo tendra el objetivo"
+            )
+        if not case.valor_esperado.strip():
+            warnings.append(
+                f"consultas.json · {case.id}: sin 'valor_esperado'; no se comprobara ninguna cifra"
+            )
 
     return SuiteSpec(
-        ok=not errors and personas is not None and cases is not None,
+        ok=not errors and bool(personas) and bool(cases),
         errors=errors,
         warnings=warnings,
         personas=personas,
@@ -352,47 +303,30 @@ def parse_suite(personas_yaml: str, cases_yaml: str) -> SuiteSpec:
     )
 
 
-def personas_for_case(spec: SuiteSpec, case: Case) -> list[str]:
-    if spec.personas is None or spec.cases is None:
-        return []
-    chosen = case.personas or spec.cases.defaults.personas
-    return list(chosen) if chosen else [p.id for p in spec.personas.personas]
-
-
 def build_matrix(
     spec: SuiteSpec,
     case_ids: list[str] | None = None,
     persona_ids: list[str] | None = None,
     repetitions: int = 1,
-    max_turns_override: int | None = None,
+    max_turns: int = DEFAULT_MAX_TURNS,
+    threshold: float = DEFAULT_THRESHOLD,
 ) -> list[EvalItemSpec]:
-    """Expande casos x personas x repeticiones en ejecuciones concretas.
+    """Expande las consultas x repeticiones en ejecuciones concretas.
 
-    Los filtros de la UI restringen, nunca amplian: una persona que el caso no
-    declara no se le aplica aunque este marcada.
+    Cada consulta trae su persona, asi que no hay producto cartesiano: filtrar
+    por persona deja fuera las consultas que no son suyas.
     """
-    if not spec.ok or spec.personas is None or spec.cases is None:
+    if not spec.ok:
         return []
-    by_id = {p.id: p for p in spec.personas.personas}
+    by_id = {p.id: p for p in spec.personas}
     items: list[EvalItemSpec] = []
-    for case in spec.cases.casos:
+    for case in spec.cases:
         if case_ids and case.id not in case_ids:
             continue
-        for pid in personas_for_case(spec, case):
-            if persona_ids and pid not in persona_ids:
-                continue
-            persona = by_id[pid]
-            max_turns = (
-                max_turns_override
-                or persona.max_turnos
-                or case.max_turnos
-                or spec.cases.defaults.max_turnos
-            )
-            threshold = (
-                case.umbral if case.umbral is not None else spec.cases.defaults.umbral_aprobacion
-            )
-            for rep in range(1, max(repetitions, 1) + 1):
-                items.append(EvalItemSpec(case, persona, rep, max_turns, threshold))
+        if persona_ids and case.persona not in persona_ids:
+            continue
+        for rep in range(1, max(repetitions, 1) + 1):
+            items.append(EvalItemSpec(case, by_id[case.persona], rep, max_turns, threshold))
     return items
 
 

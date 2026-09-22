@@ -525,9 +525,9 @@ con tu agente conectado al MCP, y al terminar un agente **evaluador** juzga la c
 con la rúbrica del caso.
 
 ```
-personas.yaml ─┐                          ┌─► comprobaciones deterministas (herramientas, cifras)
-               ├─► caso × persona × rep. ─┤
-casos.yaml ────┘   simulador ⇄ agente+MCP └─► evaluador LLM (un juicio por criterio)
+personas.json ─┐                          ┌─► comprobación determinista (las cifras esperadas)
+               ├─► consulta × repetición ─┤
+consultas.json ┘   simulador ⇄ agente+MCP └─► evaluador LLM (un juicio por criterio)
                    (N turnos, hasta <<FIN>>)          │
                                                       ▼
                                      nota = Σ pesos cumplidos / Σ pesos  (la calcula el código)
@@ -535,59 +535,97 @@ casos.yaml ────┘   simulador ⇄ agente+MCP └─► evaluador LLM (u
 
 ### Los dos ficheros
 
-Son independientes para poder combinar el mismo juego de personas con distintas baterías de
-casos. Las plantillas con la estructura propuesta están en
+Son independientes para poder combinar el mismo juego de personas con distintos bancos de
+consultas. Las plantillas están en
 [backend/app/evals/templates/](backend/app/evals/templates/) y se cargan desde la UI con el
-botón **Plantillas**. Las claves desconocidas son un error (no un aviso): en un YAML escrito a
-mano, `criterio:` en lugar de `criterios:` no debe dejar el caso sin rúbrica en silencio.
+botón **Plantillas**. Las claves desconocidas son un error (no un aviso): en un fichero escrito
+a mano, `valor-esperado` en lugar de `valor_esperado` no debe dejar la consulta sin dato que
+comprobar en silencio.
 
-**`personas.yaml`** — los usuarios que se simulan:
+**`personas.json`** — los perfiles que se simulan, indexados por su identificador:
+
+```json
+{
+  "estudiante": {
+    "nombre": "Estudiante universitario",
+    "descripcion": "Eres un estudiante de ciencias sociales que necesita datos para un trabajo academico..."
+  }
+}
+```
 
 | Campo | Para qué |
 |---|---|
-| `id` | Identificador (letras, números, `_ . -`). Se usa en MLflow. |
-| `nombre`, `descripcion` | Quién es y para qué quiere la información. |
-| `estilo` | `tono`, `conocimiento`, `paciencia`, `idioma` (texto libre). |
-| `comportamiento` | Lista de instrucciones concretas para el simulador. |
-| `max_turnos` | Opcional: sobrescribe el límite del caso para esta persona. |
+| clave | Identificador (letras, números, `_ . -`). Lo referencian las consultas y se usa en MLflow. |
+| `nombre` | Cómo se presenta la persona. |
+| `descripcion` | Quién es, qué sabe y cómo conversa. Va **tal cual** al prompt del simulador. |
 
-**`casos.yaml`** — las casuísticas a evaluar:
+**`consultas.json`** — el banco de pruebas, una lista donde cada consulta trae su persona:
+
+```json
+[
+  {
+    "id": "PG-01",
+    "persona": "estudiante",
+    "goal": "Obtener la tasa de pobreza de Ayacucho en el anio mas reciente disponible.",
+    "consulta_inicial": "Hola, necesito saber cuanta pobreza hay en Ayacucho para mi tesis.",
+    "ambiguedad": "alta",
+    "resultado_esperado": "Existe un valor y se devuelve correctamente a pesar de la ambiguedad",
+    "valor_esperado": "30.0% - 33.8% (intervalo de confianza)"
+  }
+]
+```
 
 | Campo | Para qué |
 |---|---|
-| `suite.nombre` | Nombre de la batería (etiqueta `eval_suite` en MLflow). |
-| `defaults` | `max_turnos`, `personas` (vacío = todas) y `umbral_aprobacion` (0–1). |
-| `casos[].objetivo` | Lo que la persona quiere conseguir. Lo recibe el simulador, **no** el agente. |
-| `casos[].mensaje_inicial` | Opcional: primer mensaje literal. Si falta, lo redacta el simulador. |
-| `casos[].contexto_persona` | Datos que la persona conoce y da solo si el agente se los pide. |
-| `casos[].resultado_esperado` | `tipo` (`valor`, `no_existe`, `error_controlado`, `texto`, `libre`), `descripcion`, `valor`, `unidad`, `tolerancia`, `debe_contener`, `no_debe_contener`, `peso` (3) y `obligatorio` (sí). |
-| `casos[].criterios` | Rúbrica para el evaluador: `id`, `descripcion`, `peso`, `obligatorio`. |
-| `casos[].herramientas` | Comprobaciones sobre la traza MCP: `debe_usar`, `no_debe_usar`, `max_llamadas`, `sin_errores`. |
-| `casos[].umbral`, `etiquetas`, `personas`, `max_turnos` | Ajustes por caso. |
+| `id` | Identificador de la consulta. Es la etiqueta `eval_case_id` en MLflow. |
+| `persona` | Quién la formula. Tiene que existir en `personas.json`. |
+| `goal` | Lo que la persona quiere conseguir. Lo recibe el simulador, **no** el agente. |
+| `consulta_inicial` | Primer mensaje literal. Si falta, lo redacta el simulador. |
+| `ambiguedad` | `alta`, `media` o `baja`: cuánto concreta la persona al preguntar. Modula el prompt del simulador. |
+| `resultado_esperado` | Qué debería pasar, en texto libre (*"Existe un valor y se devuelve correctamente"*, *"No se encuentra disponible el valor o no existe"*). |
+| `valor_esperado` | El dato esperado, en texto libre: una cifra (`330481.79`), una serie (`863, 933, 4907`), un rango (`30.0% - 33.8%`), un ámbito temático (`empleo o mercado laboral`) o `No aplica`. |
 
-Ejemplos de las dos casuísticas típicas: *"la pobreza 2025 de Lima Metropolitana es X"* es un
-`tipo: valor` con `valor` y `tolerancia`; *"el indicador no existe para ese periodo"* es un
-`tipo: no_existe`, que se cumple solo si el agente lo dice claramente y **no inventa** una cifra.
+**No hay producto cartesiano**: cada consulta se ejecuta con su persona y nada más. Descartar
+una persona en la UI descarta sus consultas.
+
+### La rúbrica no está en los ficheros
+
+El banco de pruebas dice qué se pide y qué debería salir; cómo se puntúa lo fija el código
+(`CRITERIOS` / `criterios_de` en [spec.py](backend/app/evals/spec.py)), igual para todas las
+consultas:
+
+| Elemento | Peso | Obligatorio | Quién lo decide |
+|---|---|---|---|
+| `resultado_esperado` | 3 | sí | evaluador LLM |
+| `valor_esperado` (si lo hay) | 3 | no | evaluador LLM |
+| `sin_invenciones` — toda cifra que afirma viene de una herramienta | 2 | sí | evaluador LLM |
+| `respuesta_util` — contesta a lo que se pide y al nivel de la persona | 1 | no | evaluador LLM |
+| `valor_mencionado` (si `valor_esperado` trae cifras) | 1 | no | código |
+
+`max_turnos` y el `umbral` de aprobación tampoco están en los ficheros: son de la ejecución y
+se ajustan en la UI (6 y 0,7 por defecto).
 
 ### Cómo se puntúa
 
 * El evaluador LLM solo decide, criterio a criterio, si se cumple y por qué. Un criterio sobre
   el que no se pronuncia cuenta como no cumplido (y se marca).
-* Las **comprobaciones deterministas** no pasan por ningún LLM: herramientas usadas o no,
-  número de llamadas, errores del MCP, y si la cifra esperada aparece en las respuestas
-  (acepta `24,9` y `24.9`, con la tolerancia indicada).
-* La **nota** la calcula el código con los pesos del YAML. El caso se **aprueba** si la nota
-  llega al umbral *y* se cumplen todos los elementos obligatorios. Cambiar de evaluador cambia
-  los juicios, nunca la aritmética.
-* Si el evaluador no devuelve un JSON válido tras un reintento, el caso queda en `error`
+* La **comprobación determinista** no pasa por ningún LLM: si `valor_esperado` trae cifras,
+  comprueba que todas aparezcan en las respuestas del agente (acepta `4.907` y `4907`, `24,9` y
+  `24.9`). Un `valor_esperado` sin cifras (`empleo o mercado laboral`, `No aplica`) no genera
+  comprobación: lo juzga el evaluador leyendo el texto.
+* La **nota** la calcula el código con los pesos de la rúbrica. La consulta se **aprueba** si la
+  nota llega al umbral *y* se cumplen todos los elementos obligatorios. Cambiar de evaluador
+  cambia los juicios, nunca la aritmética.
+* Si el evaluador no devuelve un JSON válido tras un reintento, la consulta queda en `error`
   (no suspende): es un fallo del instrumento, no del agente.
 
 ### En la UI
 
-1. **Ficheros**: carga o edita los dos YAML; se validan al vuelo con errores legibles
-   (`casos.yaml · casos[0] (pobreza_lima_2025).resultado_esperado.tipo: ...`).
-2. **Qué ejecutar**: marca casos y personas, repeticiones (para medir la variabilidad del
-   agente) y, si quieres, un límite de turnos que manda sobre el del YAML.
+1. **Ficheros**: carga o edita los dos JSON; se validan al vuelo con errores legibles
+   (`consultas.json · [0] (PG-01).valor-esperado: clave no reconocida`). El nombre del fichero
+   de consultas se usa como nombre del banco (`eval_suite` en MLflow).
+2. **Qué ejecutar**: marca consultas y personas, repeticiones (para medir la variabilidad del
+   agente), el límite de turnos y el umbral de aprobación.
 3. **Modelos**: el agente bajo prueba usa lo configurado en *Modelo* y *Servidor MCP*, igual
    que el chat. El simulador y el evaluador pueden usar el mismo modelo o cualquier otro del
    catálogo (también de nube, con la clave guardada en *Modelo*). Por defecto el simulador va
@@ -612,10 +650,10 @@ Se reutiliza la jerarquía del chat, con etiquetas extra:
 ```
 Experimento
   Run padre   -> la ejecución          (tags: kind=evaluation, eval_run_id, eval_suite)
-     params:     modelos de agente/simulador/evaluador, MCP, hashes de los YAML
+     params:     modelos de agente/simulador/evaluador, MCP, hashes de los dos ficheros
      metrics:    eval.pass_rate, eval.avg_score, eval.passed/failed/errors, tokens.agent/simulator/judge
-     artifacts:  evaluation/personas.yaml, casos.yaml, summary.json, results.json (tabla)
-    Run hijo  -> caso × persona × rep.  (tags: eval_case_id, eval_persona_id, eval.status)
+     artifacts:  evaluation/personas.json, consultas.json, summary.json, results.json (tabla)
+    Run hijo  -> consulta × repetición  (tags: eval_case_id, eval_persona_id, eval.status)
      metrics:    eval.score, eval.passed, eval.turns, sim.*, judge.*, agent.*
      artifacts:  evaluation/result.json (transcripción + rúbrica), judge.json (prompt y respuesta),
                  criteria.json (tabla)
@@ -625,16 +663,16 @@ Experimento
       Traza del evaluador               (tags: eval_role=judge)
 ```
 
-Los YAML se guardan tal cual en el run padre, así que cualquier ejecución es reproducible
-desde MLflow. Consultas útiles:
+Los dos ficheros se guardan tal cual en el run padre, así que cualquier ejecución es
+reproducible desde MLflow. Consultas útiles:
 
 ```python
 # Comparar ejecuciones de una misma batería
 mlflow.search_runs(experiment_names=["agente-pruebas-mcp"],
                    filter_string="tags.kind = 'evaluation' and tags.level = 'session'")
 
-# Todas las trazas de un caso concreto, en todas las ejecuciones
-mlflow.search_traces(locations=[exp_id], filter_string="tags.eval_case_id = 'pobreza_lima_2025'")
+# Todas las trazas de una consulta concreta, en todas las ejecuciones
+mlflow.search_traces(locations=[exp_id], filter_string="tags.eval_case_id = 'PG-01'")
 ```
 
 Borrar la ejecución desde la UI borra su sesión, sus conversaciones y todo su rastro en MLflow
@@ -664,12 +702,12 @@ backend/app/
     loop.py                bucle LLM ↔ herramientas, emisión de eventos, métricas
     prompts.py             system prompt del agente de pruebas
   evals/
-    spec.py                estructura y validación de personas.yaml / casos.yaml
+    spec.py                estructura y validación de personas.json / consultas.json, y la rúbrica
     simulator.py           agente que interpreta a la persona (cierra con <<FIN>>)
     judge.py               agente evaluador (JSON con un juicio por criterio)
     checks.py              comprobaciones deterministas, nota y parseo del JSON
     runner.py              ejecución en segundo plano, eventos SSE, SQLite y MLflow
-    templates/             plantillas de los dos YAML
+    templates/             plantillas de los dos ficheros
   store/                   esquema SQLite y repositorio
   observability/
     mlflow_tracker.py      runs, traces, spans, métricas, artefactos y assessments
@@ -729,7 +767,7 @@ cd backend
 .venv\Scripts\python.exe tests\test_agent_loop.py       # agente + MCP + MLflow (LLM simulado)
 .venv\Scripts\python.exe tests\test_cloud_providers.py  # traducción al dialecto de cada nube
 .venv\Scripts\python.exe tests\test_http_smoke.py       # circuito completo con el modelo real
-.venv\Scripts\python.exe -m pytest tests\test_evals.py  # evaluaciones: YAML, nota y batería completa
+.venv\Scripts\python.exe -m pytest tests\test_evals.py  # evaluaciones: ficheros, nota y batería completa
 ```
 
 `test_evals.py` tampoco necesita Ollama, MCP ni MLflow: ejecuta una batería entera con tres

@@ -1,4 +1,4 @@
-"""Evaluaciones: validar YAML, lanzar baterias, seguirlas y consultarlas."""
+"""Evaluaciones: validar los ficheros, lanzar baterias, seguirlas y consultarlas."""
 
 from __future__ import annotations
 
@@ -53,35 +53,37 @@ async def _mlflow_links(run: dict) -> dict:
 
 @router.get("/templates")
 async def templates() -> dict:
-    """Plantillas de ejemplo con la estructura propuesta de los dos YAML."""
+    """Plantillas de ejemplo con la estructura de los dos ficheros."""
     return {
-        "personas_yaml": (TEMPLATES / "personas.yaml").read_text(encoding="utf-8"),
-        "cases_yaml": (TEMPLATES / "casos.yaml").read_text(encoding="utf-8"),
+        "personas_json": (TEMPLATES / "personas.json").read_text(encoding="utf-8"),
+        "consultas_json": (TEMPLATES / "consultas.json").read_text(encoding="utf-8"),
     }
 
 
 @router.post("/validate")
 async def validate(payload: ValidateEvalRequest) -> dict:
     """Valida la pareja de ficheros y devuelve lo que se ejecutaria."""
-    return parse_suite(payload.personas_yaml, payload.cases_yaml).summary()
+    return parse_suite(payload.personas_json, payload.consultas_json).summary()
 
 
 @router.post("/runs")
 async def start_run(payload: StartEvalRequest) -> dict:
     agent = AgentModel(**payload.agent.model_dump())
     request = EvalRequest(
-        personas_yaml=payload.personas_yaml,
-        cases_yaml=payload.cases_yaml,
+        personas_json=payload.personas_json,
+        consultas_json=payload.consultas_json,
         agent=agent,
         simulator=_role(payload.simulator, agent),
         judge=_role(payload.judge, agent),
         mcp_conn_ids=payload.mcp_conn_ids,
         name=payload.name,
+        suite=payload.suite,
         mlflow_experiment=payload.mlflow_experiment,
         case_ids=payload.case_ids,
         persona_ids=payload.persona_ids,
         repetitions=payload.repetitions,
-        max_turns_override=payload.max_turns_override,
+        max_turns=payload.max_turns,
+        threshold=payload.threshold,
     )
     try:
         job = await eval_manager.start(request)

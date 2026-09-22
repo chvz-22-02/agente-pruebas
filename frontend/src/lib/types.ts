@@ -231,17 +231,15 @@ export type EvalValidation = {
   ok: boolean;
   errors: string[];
   warnings: string[];
-  suite: { nombre: string; descripcion: string } | null;
-  defaults: { max_turnos: number; personas: string[]; umbral_aprobacion: number } | null;
   personas: { id: string; nombre: string; descripcion: string }[];
   cases: {
     id: string;
-    titulo: string;
-    objetivo: string;
-    tipo: string;
-    personas: string[];
-    criterios: number;
-    etiquetas: string[];
+    persona: string;
+    goal: string;
+    consulta_inicial: string;
+    ambiguedad: string;
+    resultado_esperado: string;
+    valor_esperado: string;
   }[];
   matrix: number;
 };

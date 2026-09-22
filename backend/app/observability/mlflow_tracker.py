@@ -6,6 +6,9 @@ Modelo de datos que se replica en MLflow:
     Run (padre)         -> una SESION       (tag: session_id)
       Run (hijo)        -> una CONVERSACION (tags: session_id, conversation_id)
         Trace           -> una INTERACCION  (tag: interaction_id)
+                           `mlflow.sourceRun` = run de conversacion y, ademas,
+                           enlazada al run de sesion (`link_traces_to_run`)
+                           para que ambos niveles la listen en la UI.
           span AGENT    -> el bucle completo
           span LLM      -> cada llamada al modelo (tokens, latencia)
           span TOOL     -> cada llamada al servidor MCP (args, resultado, JSON-RPC)
@@ -96,6 +99,7 @@ class InteractionTrace:
     conversation_id: str
     interaction_id: str
     run_id: str = ""
+    session_run_id: str = ""
     trace_id: str = ""
     experiment_id: str = ""
     experiment: str = ""
@@ -123,6 +127,9 @@ class MLflowTracker:
         self._session_runs: dict[tuple[str, str], str] = {}
         self._conversation_runs: dict[tuple[str, str], str] = {}
         self._steps: dict[str, int] = {}
+        # Runs de sesion cuyo ciclo de vida gestiona quien los creo (las
+        # evaluaciones): el bucle del agente no debe darlos por terminados.
+        self._owned_session_runs: set[str] = set()
         self._lock = asyncio.Lock()
 
     # ------------------------------------------------------------- arranque -
@@ -137,6 +144,10 @@ class MLflowTracker:
         # minutos en vez de fallar y seguir.
         os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", str(int(settings.mlflow_http_timeout)))
         os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", str(settings.mlflow_http_retries))
+        # `set_terminated` escribe en stdout la URL del run con un emoji ANTES
+        # de cambiar el estado. En la consola de Windows (cp1252) eso lanza
+        # UnicodeEncodeError y el run se queda en RUNNING para siempre.
+        os.environ.setdefault("MLFLOW_SUPPRESS_PRINTING_URL_TO_STDOUT", "true")
 
         mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
         client = MlflowClient(tracking_uri=settings.mlflow_tracking_uri)
@@ -325,6 +336,8 @@ class MLflowTracker:
             return ""
         async with self._lock:
             self._session_runs[cache_key] = run_id
+            if tags:
+                self._owned_session_runs.add(run_id)
         return run_id
 
     async def ensure_conversation_run(
@@ -586,6 +599,9 @@ class MLflowTracker:
         async with self._lock:
             step = self._steps.get(conversation_id, 0)
             self._steps[conversation_id] = step + 1
+            # La traza lleva `mlflow.sourceRun` = run de conversacion; al
+            # cerrarla se vincula ademas al run de sesion (ver `link_traces`).
+            trace.session_run_id = self._session_runs.get((trace.experiment_id, session_id), "")
         trace.step = step
 
         if self._start_span is None:
@@ -692,6 +708,44 @@ class MLflowTracker:
         except Exception:  # noqa: BLE001
             pass
 
+    # -------------------------------------------------------------- enlaces -
+    def _link_traces_sync(self, run_id: str, trace_ids: list[str]) -> None:
+        # Las trazas se exportan en segundo plano y `link_traces_to_run`
+        # descarta en silencio los ids que todavia no existen en el servidor:
+        # hay que vaciar la cola antes de enlazar.
+        try:
+            self._mlflow.flush_trace_async_logging()
+        except Exception:  # noqa: BLE001 - no existe en todas las versiones
+            pass
+        self._client.link_traces_to_run(trace_ids, run_id)
+
+    async def link_traces(self, run_id: str, trace_ids: list[str]) -> bool:
+        """Vincula trazas a un run ademas del que llevan en `mlflow.sourceRun`.
+
+        Una traza solo puede tener un `sourceRun` (el de la conversacion), pero
+        la UI de MLflow tambien la muestra bajo cualquier run al que este
+        enlazada por asociacion. Asi el run de sesion (o el de la bateria de
+        evaluacion) lista las trazas de todas sus conversaciones.
+        """
+        trace_ids = [t for t in trace_ids if t]
+        if not self.available or not run_id or not trace_ids:
+            return False
+        try:
+            await asyncio.to_thread(self._link_traces_sync, run_id, trace_ids)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("MLflow: no se pudieron enlazar trazas al run %s: %s", run_id, exc)
+            return False
+
+    def _finish_run_sync(self, run_id: str, status: str = "FINISHED") -> None:
+        """Marca un run como terminado sin sacarlo de la cache.
+
+        MLflow admite seguir registrando en un run terminado, asi que la
+        conversacion puede continuar en interacciones posteriores; solo se
+        actualiza `end_time` y deja de aparecer como RUNNING en la UI.
+        """
+        self._client.set_terminated(run_id, status)
+
     # ------------------------------------------------------------ artifacts -
     async def log_artifact(self, run_id: str, artifact_file: str, payload: Any) -> str:
         """Sube un JSON completo (sin recortar) al run indicado.
@@ -787,6 +841,7 @@ class MLflowTracker:
             for cache in (self._conversation_runs, self._session_runs):
                 for key in [k for k, v in cache.items() if v == run_id]:
                     cache.pop(key, None)
+            self._owned_session_runs.discard(run_id)
         try:
             await asyncio.to_thread(self._client.set_terminated, run_id, status)
         except Exception:  # noqa: BLE001
@@ -954,6 +1009,21 @@ class MLflowTracker:
                 if trace.trace_id:
                     try:
                         self._client.set_tag(trace.run_id, "last_trace_id", trace.trace_id)
+                    except Exception:  # noqa: BLE001
+                        pass
+                try:
+                    self._finish_run_sync(trace.run_id)
+                except Exception:  # noqa: BLE001
+                    pass
+            if trace.session_run_id:
+                if trace.trace_id:
+                    try:
+                        self._link_traces_sync(trace.session_run_id, [trace.trace_id])
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("MLflow: no se pudo enlazar la traza a la sesion: %s", exc)
+                if trace.session_run_id not in self._owned_session_runs:
+                    try:
+                        self._finish_run_sync(trace.session_run_id)
                     except Exception:  # noqa: BLE001
                         pass
 

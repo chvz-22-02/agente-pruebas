@@ -175,7 +175,7 @@ function ResultDetail({
           <div key={index} className="msg user">
             <div className="who">
               {result.persona_name} · turno {turn.turn}
-              {turn.source === "guion" && " · mensaje del YAML"}
+              {turn.source === "guion" && " · consulta_inicial del fichero"}
               {turn.closing && " · cierre (no se envia al agente)"}
             </div>
             <div className="bubble">{turn.text}</div>

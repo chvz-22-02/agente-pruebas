@@ -448,18 +448,18 @@ async def create_eval_run(
     name: str,
     suite: str,
     config: dict[str, Any],
-    personas_yaml: str,
-    cases_yaml: str,
+    personas_json: str,
+    consultas_json: str,
     mlflow_experiment: str,
 ) -> None:
     await db.execute(
         """INSERT INTO eval_runs
-           (id, session_id, name, suite, status, created_at, config, personas_yaml, cases_yaml,
+           (id, session_id, name, suite, status, created_at, config, personas_json, consultas_json,
             mlflow_experiment)
            VALUES (?,?,?,?,?,?,?,?,?,?)""",
         (
             eval_run_id, session_id, name, suite, "running", now(), dumps(config),
-            personas_yaml, cases_yaml, mlflow_experiment,
+            personas_json, consultas_json, mlflow_experiment,
         ),
     )
 
