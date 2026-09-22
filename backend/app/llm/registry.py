@@ -19,6 +19,7 @@ from typing import Any
 from ..config import settings
 from .anthropic_provider import AnthropicProvider
 from .base import LLMProvider
+from .bedrock_provider import BedrockProvider
 from .catalog import CATALOG
 from .cloud_openai_providers import (
     CloudflareProvider,
@@ -36,6 +37,7 @@ PROVIDERS: dict[str, type[LLMProvider]] = {
     "google": GoogleProvider,
     "cloudflare": CloudflareProvider,
     "nvidia": NvidiaProvider,
+    "aws": BedrockProvider,
     "openai_compat": OpenAICompatProvider,
 }
 

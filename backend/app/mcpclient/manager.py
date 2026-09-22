@@ -159,7 +159,19 @@ class ToolRouter:
                 error=f"La herramienta '{exposed_name}' no existe. Disponibles: {available}",
             )
         conn_id, real_name = target
-        result = await self.manager.get(conn_id).call_tool(real_name, arguments)
+        try:
+            result = await self.manager.get(conn_id).call_tool(real_name, arguments)
+        except MCPConnectionError as exc:
+            # El servidor se cayo a mitad del turno. Se le devuelve al modelo
+            # como observacion, igual que cualquier otro error de herramienta:
+            # el turno termina y se puede evaluar, en vez de reventar el bucle.
+            return MCPToolResult(
+                tool_name=exposed_name,
+                arguments=arguments,
+                ok=False,
+                text="",
+                error=str(exc),
+            )
         result.tool_name = exposed_name
         return result
 

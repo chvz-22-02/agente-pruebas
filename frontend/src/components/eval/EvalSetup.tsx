@@ -176,11 +176,12 @@ function RoleEditor({
             </datalist>
           </div>
           {info?.account_env ? (
-            // La URL de Cloudflare lleva la cuenta dentro: se pide solo el Account ID.
+            // Hay proveedores cuya URL lleva un dato dentro (la cuenta en
+            // Cloudflare, la region en AWS): se pide aparte y se inserta.
             <input
               value={accountFromUrl(info.default_base_url, value.base_url)}
               onChange={(e) => set({ base_url: withAccount(info.default_base_url, e.target.value) })}
-              placeholder={`Account ID (vacio = ${info.account_env} de backend/.env)`}
+              placeholder={`${info.account_label || "Account ID"} (vacio = ${info.account_env} de backend/.env)`}
               spellCheck={false}
               style={{ marginBottom: 6 }}
             />

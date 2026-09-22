@@ -218,8 +218,10 @@ export type ProviderInfo = {
   key_env: string;
   key_hint: string;
   console_url: string;
-  /** Variable con el identificador de cuenta si la URL lo lleva (Cloudflare). */
+  /** Variable con el dato que va dentro de la URL (Cloudflare: cuenta, AWS: region). */
   account_env: string;
+  /** Como se llama ese dato en la UI ("Account ID", "Region"). */
+  account_label: string;
   supports_pull: boolean;
   models: CatalogModel[];
 };

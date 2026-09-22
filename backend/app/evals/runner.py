@@ -177,6 +177,17 @@ class EvalJob:
         if self.task and not self.task.done():
             self.task.cancel()
 
+    def _mcp_lost(self) -> str:
+        """Se declararon servidores MCP y ya no queda ninguno vivo."""
+        declared = self.request.mcp_conn_ids
+        if not declared or mcp_manager.alive_ids(declared):
+            return ""
+        return (
+            "Se perdio la conexion con el servidor MCP y no queda ninguno activo. "
+            "Los casos que faltan se ejecutarian sin herramientas, asi que se detiene aqui: "
+            "reconecta el MCP y relanza lo que quede."
+        )
+
     # ---------------------------------------------------------------- run ---
     async def run(self) -> None:
         final_status = "done"
@@ -186,6 +197,14 @@ class EvalJob:
             for index, item in enumerate(self.items):
                 if self.cancel_requested:
                     break
+                if lost := self._mcp_lost():
+                    # Sin MCP el agente responde de memoria y los casos que
+                    # queden "pasarian" sin haber probado nada: eso no es un
+                    # resultado, es ruido. Mejor parar y decirlo.
+                    final_status, error = "error", lost
+                    logger.error("Evaluacion %s detenida: %s", self.id, lost)
+                    self.emit("log", level="error", message=lost)
+                    break
                 try:
                     await self._run_item(index, item)
                 except asyncio.CancelledError:
@@ -194,12 +213,25 @@ class EvalJob:
                     logger.exception("Caso %s fallido", self.result_ids[index])
                     await self._item_failed(index, item, f"{type(exc).__name__}: {exc}")
         except asyncio.CancelledError:
-            final_status = "cancelled"
-            logger.info("Evaluacion %s cancelada", self.id)
-            # Se consume la cancelacion para poder cerrar SQLite y MLflow.
+            # `cancelling()` distingue una cancelacion de verdad de esta tarea
+            # de un CancelledError que sube desde mas abajo. Lo segundo es un
+            # fallo -no un "el usuario pulso detener"- y hacerlo pasar por una
+            # cancelacion deja la bateria a medias sin que nadie se entere.
             task = asyncio.current_task()
-            if task is not None and hasattr(task, "uncancel"):
-                task.uncancel()
+            if self.cancel_requested or (task is not None and task.cancelling()):
+                final_status = "cancelled"
+                logger.info("Evaluacion %s cancelada", self.id)
+                # Se consume la cancelacion para poder cerrar SQLite y MLflow.
+                if task is not None:
+                    task.uncancel()
+            else:
+                final_status = "error"
+                error = (
+                    "Cancelacion inesperada a mitad de la ejecucion; nadie pidio detenerla. "
+                    "Suele ser una conexion (MCP o proveedor) que se cae bajo los pies del agente."
+                )
+                logger.error("Evaluacion %s: %s", self.id, error)
+                self.emit("log", level="error", message=error)
         except Exception as exc:  # noqa: BLE001 - se reporta en la UI y en SQLite
             logger.exception("Evaluacion %s fallida", self.id)
             final_status = "error"

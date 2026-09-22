@@ -314,6 +314,93 @@ async def _battery(tmp_path: Path) -> None:
         await db.close()
 
 
+class DyingAgentLLM(_Scripted):
+    """Como una conexion MCP que se cae: CancelledError subiendo desde abajo."""
+
+    async def chat(self, messages: list[dict[str, Any]], tools: list[ToolSpec] | None = None,
+                   **kwargs: Any) -> LLMResponse:
+        raise asyncio.CancelledError
+
+
+def test_foreign_cancellation_is_an_error_not_a_stop(tmp_path: Path) -> None:
+    """Regresion: una bateria se detuvo sola y la UI la dio por 'cancelada'.
+
+    Nadie habia pulsado detener: la conexion MCP se cayo y su CancelledError
+    llego hasta arriba. Hacerlo pasar por una cancelacion del usuario esconde
+    el fallo justo donde hay que verlo.
+    """
+    asyncio.run(_foreign_cancel(tmp_path))
+
+
+async def _foreign_cancel(tmp_path: Path) -> None:
+    from app.evals.runner import AgentModel, EvalRequest, RoleModel, eval_manager
+    from app.llm import registry
+    from app.store import repository as repo
+    from app.store.db import db
+
+    registry.PROVIDERS.update({"s_dying": DyingAgentLLM, "s_sim": SimulatorLLM, "s_judge": JudgeLLM})  # type: ignore[dict-item]
+    db.path = str(tmp_path / "cancel.sqlite3")
+    await db.connect()
+    try:
+        job = await eval_manager.start(
+            EvalRequest(
+                personas_json=PERSONAS,
+                consultas_json=CASES,
+                agent=AgentModel(provider="s_dying", base_url="http://scripted", model="agente"),
+                simulator=RoleModel(provider="s_sim", base_url="http://scripted", model="simulador"),
+                judge=RoleModel(provider="s_judge", base_url="http://scripted", model="juez"),
+            )
+        )
+        [e async for e in eval_manager.stream(job, 0)]
+
+        run = await repo.get_eval_run(job.id)
+        assert run is not None and run["status"] == "error", run["status"]
+        assert "Cancelacion inesperada" in run["error"], run["error"]
+        assert not job.cancel_requested
+        # Lo que no llego a ejecutarse queda como error, no como cancelado.
+        assert {r["status"] for r in await repo.list_eval_results(job.id)} == {"error"}
+    finally:
+        await db.close()
+
+
+def test_battery_stops_when_the_mcp_is_gone(tmp_path: Path) -> None:
+    """Sin MCP los casos restantes se ejecutarian sin herramientas: eso no es un resultado."""
+    asyncio.run(_mcp_gone(tmp_path))
+
+
+async def _mcp_gone(tmp_path: Path) -> None:
+    from app.evals.runner import AgentModel, EvalRequest, RoleModel, eval_manager
+    from app.llm import registry
+    from app.store import repository as repo
+    from app.store.db import db
+
+    registry.PROVIDERS.update({"s_agent": AgentLLM, "s_sim": SimulatorLLM, "s_judge": JudgeLLM})  # type: ignore[dict-item]
+    db.path = str(tmp_path / "sinmcp.sqlite3")
+    await db.connect()
+    try:
+        job = await eval_manager.start(
+            EvalRequest(
+                personas_json=PERSONAS,
+                consultas_json=CASES,
+                agent=AgentModel(provider="s_agent", base_url="http://scripted", model="agente"),
+                simulator=RoleModel(provider="s_sim", base_url="http://scripted", model="simulador"),
+                judge=RoleModel(provider="s_judge", base_url="http://scripted", model="juez"),
+                # Se declaro un MCP que ya no esta vivo.
+                mcp_conn_ids=["mcp_fantasma"],
+            )
+        )
+        events = [e async for e in eval_manager.stream(job, 0)]
+
+        run = await repo.get_eval_run(job.id)
+        assert run is not None and run["status"] == "error", run["status"]
+        assert "no queda ninguno activo" in run["error"], run["error"]
+        # Se avisa en el registro en vivo, y no se ejecuta ningun caso.
+        assert any(e["type"] == "log" and e.get("level") == "error" for e in events)
+        assert not any(e["type"] == "item_start" for e in events)
+    finally:
+        await db.close()
+
+
 class EagerFinSimulatorLLM(_Scripted):
     """Como Nemotron: a veces cierra su primera pregunta con <<FIN>>."""
 

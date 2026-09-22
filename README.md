@@ -126,6 +126,7 @@ introduciendo la clave desde la interfaz. No hace falta reiniciar el backend ni 
 | **Google** | Familias Gemini **pro**, **flash** y **flash-lite**, incluidos los `-preview` |
 | **Cloudflare Workers AI** | GLM-4.7 Flash · gpt-oss 120B / 20B · Qwen3 30B · Mistral Small 3.1 · Llama 4 Scout · Llama 3.3 70B (solo modelos con *function calling*) |
 | **NVIDIA (build.nvidia.com)** | Nemotron 3 Super · GLM-5.3 / 5.3 Flash · DeepSeek V4 Flash · gpt-oss 20B · Mistral Nemotron |
+| **AWS (Amazon Bedrock)** | Claude Sonnet 4.6 · Claude Haiku 4.5 · Amazon Nova 2 Lite · gpt-oss 120B · DeepSeek V3.2 · Qwen3 Coder Next |
 
 Flujo: elige el proveedor → pega la clave → **Validar**. Si la clave es buena, el desplegable
 de modelos se rellena con **los modelos reales de tu cuenta** (consultados a la API), no solo
@@ -144,7 +145,7 @@ Dos opciones, y el backend acepta las dos:
    Es cómodo, pero no es un almacén de secretos: cualquier script que corra en ese origen
    puede leerla.
 2. **En el backend.** Deja el campo vacío y define `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
-   `GOOGLE_API_KEY`, `CLOUDFLARE_API_TOKEN` o `NVIDIA_API_KEY` en `backend/.env`. El backend la usa cuando la UI
+   `GOOGLE_API_KEY`, `CLOUDFLARE_API_TOKEN`, `NVIDIA_API_KEY` o `AWS_BEARER_TOKEN_BEDROCK` en `backend/.env`. El backend la usa cuando la UI
    no manda ninguna.
 
 En ambos casos la clave se usa solo para la petición en curso: **no se persiste en SQLite, no
@@ -213,6 +214,45 @@ NVIDIA_API_KEY=nvapi-...
   Flash tienen colas de varios minutos. `/v1/models` lista también modelos que una cuenta
   gratuita no puede usar (`404 Function not found for account`), como Kimi K2.6 o Nemotron
   Nano 3, por eso no están en el selector.
+
+#### AWS (Amazon Bedrock)
+
+Bedrock publica **también** un endpoint compatible con OpenAI, que habría encajado sin escribir
+código, igual que Gemini. No sirve: su matriz de compatibilidad deja fuera a **Claude, Nova y
+Llama**, justo las familias por las que se usa Bedrock. Así que aquí se habla su **API nativa
+Converse**, la única con una forma única de *tool calling* para todos los modelos de chat del
+servicio — y sin herramientas no se puede probar un MCP.
+
+```ini
+# backend/.env — clave en la consola de Bedrock -> API keys
+AWS_BEARER_TOKEN_BEDROCK=...
+AWS_REGION=us-east-1
+```
+
+* **Sin boto3 y sin firmar nada.** La clave de API de Bedrock viaja como
+  `Authorization: Bearer`, así que basta `httpx`. No hace falta SigV4, ni access key, ni secret.
+  Las claves son de dos tipos: las de corta duración (≤12 h, heredan los permisos de tu rol) y
+  las de larga duración, que AWS marca como "solo para explorar".
+* **La región va dentro del host** (`bedrock-runtime.<region>.amazonaws.com`), así que se pide
+  en su propio campo de la pestaña **Modelo**, como el Account ID de Cloudflare. Tiene que ser
+  la misma región en la que generaste la clave.
+* **Perfiles de inferencia.** Muchos modelos no se invocan por su identificador pelado y exigen
+  el del perfil, con prefijo de región (`us.anthropic.…`). Pero **no es universal**: varios
+  modelos abiertos solo existen por su identificador base y solo en algunas regiones. Por eso
+  *Validar* consulta las dos listas de la cuenta (`ListInferenceProfiles` y
+  `ListFoundationModels`) y descarta los identificadores retirados.
+* **Si *Validar* falla con 403**, puede ser la clave o pueden ser los permisos: la política que
+  AWS engancha por defecto a las claves no siempre incluye `bedrock:ListInferenceProfiles` y
+  `bedrock:ListFoundationModels`. En ese caso la inferencia funciona igual; escribe el
+  identificador del modelo a mano.
+* **Acceso a los modelos.** Está habilitado por defecto en las regiones comerciales y se
+  suscribe solo en la primera invocación, pero los modelos de **Anthropic piden además rellenar
+  una vez su formulario de acceso** en la consola. Si falta, sale un `AccessDeniedException`.
+* **Razonamiento.** Converse no tiene un campo común: viaja en `additionalModelRequestFields` y
+  el esquema lo valida contra cada modelo, así que una clave inventada es un 400 duro. Solo se
+  manda donde AWS lo documenta — `thinking` en Claude, `reasoningConfig` en Nova — y a DeepSeek
+  (que razona siempre), gpt-oss y Qwen no se les manda nada. Si aun así lo rechazan, el backend
+  lo retira y lo recuerda, igual que con los motores locales.
 
 #### Detalles de cada API que el código tiene en cuenta
 
@@ -301,6 +341,7 @@ implementaciones:
 * `ollama` — Ollama (por defecto).
 * `anthropic` — Claude, sobre el SDK oficial.
 * `openai` / `google` / `cloudflare` / `nvidia` — OpenAI, Gemini, Workers AI y build.nvidia.com.
+* `aws` — Amazon Bedrock, por su API nativa Converse.
 * `openai_compat` — cualquier servidor con API compatible OpenAI: `llama-server` de
   llama.cpp, LM Studio, vLLM, TGI, LocalAI…
 
@@ -639,9 +680,12 @@ con el razonamiento y las tramas JSON-RPC.
 
 La ejecución corre **en el backend**, no en el navegador: recargar la página no la detiene y la
 UI se reengancha sola. Se puede cancelar (lo ya evaluado se conserva). Si se reinicia el
-backend, las que estaban en marcha quedan como `interrumpida`. Orientativo en CPU: cada turno
-cuesta una o dos llamadas al modelo del agente más una del simulador, y cada caso una del
-evaluador, así que un caso de 3 turnos con modelos de 4–8 B tarda varios minutos.
+backend, las que estaban en marcha quedan como `interrumpida`. Si el **servidor MCP se cae** a
+media batería, la ejecución se detiene con estado `error` y el motivo a la vista, en vez de
+seguir con los casos restantes sin herramientas: reconecta el MCP y relanza lo que falte
+marcando solo esas consultas. Orientativo en CPU: cada turno cuesta una o dos llamadas al
+modelo del agente más una del simulador, y cada caso una del evaluador, así que un caso de 3
+turnos con modelos de 4–8 B tarda varios minutos.
 
 ### Qué queda en MLflow
 
@@ -692,6 +736,7 @@ backend/app/
     ollama_provider.py     Ollama
     anthropic_provider.py  Claude (SDK oficial)
     cloud_openai_providers.py  OpenAI, Gemini, Cloudflare Workers AI y NVIDIA
+    bedrock_provider.py    Amazon Bedrock (API Converse)
     openai_compat_provider.py  llama.cpp / LM Studio / vLLM / ...
     registry.py            fábrica y caché de proveedores (clave por hash)
   mcpclient/
@@ -746,6 +791,18 @@ scripts/
 * **Errores de herramienta como observación.** Si un MCP falla, el error no rompe el turno:
   se le devuelve al modelo como resultado de la herramienta para que reaccione, y queda
   marcado en rojo en la UI y contabilizado en `tool_errors`.
+* **Una conexión MCP que se cae no es una cancelación.** Cuando el servidor se cierra con una
+  llamada en vuelo, la tarea supervisora de la conexión **falla** el *future* de quien espera
+  en vez de cancelarlo. La diferencia importa: `CancelledError` es `BaseException`, así que se
+  cuela por los `except Exception` del bucle del agente —dejando la traza a medias y las
+  métricas sin escribir— y más arriba una batería de evaluación lo confunde con un *Detener*
+  del usuario. Lo que quedara encolado también falla en el acto, en vez de esperar el timeout
+  completo a una conexión que ya no atiende a nadie.
+* **La evaluación distingue quién canceló.** `Task.cancelling()` separa una cancelación real de
+  la batería de un `CancelledError` que sube desde más abajo; lo segundo se registra como
+  **error**, con su motivo, en lugar de hacerlo pasar por una parada voluntaria. Y si se
+  declararon servidores MCP pero ya no queda ninguno vivo, la batería se detiene ahí: los casos
+  restantes se ejecutarían sin herramientas y "aprobarían" sin haber probado nada.
 * **El run de MLflow se crea con la primera interacción**, no al crear la sesión. Una sesión
   que se abre y no se usa no deja rastro en el experimento.
 * **Vaciado antes de purgar.** MLflow exporta las trazas en segundo plano; al borrar una
@@ -768,6 +825,7 @@ cd backend
 .venv\Scripts\python.exe tests\test_cloud_providers.py  # traducción al dialecto de cada nube
 .venv\Scripts\python.exe tests\test_http_smoke.py       # circuito completo con el modelo real
 .venv\Scripts\python.exe -m pytest tests\test_evals.py  # evaluaciones: ficheros, nota y batería completa
+.venv\Scripts\python.exe -m pytest tests\test_mcp_connection.py  # qué pasa si el MCP se cae a media prueba
 ```
 
 `test_evals.py` tampoco necesita Ollama, MCP ni MLflow: ejecuta una batería entera con tres

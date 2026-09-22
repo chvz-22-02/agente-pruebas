@@ -93,7 +93,7 @@ function AccountIdBox({
   return (
     <label className="field">
       <span>
-        Account ID <code>({info.account_env})</code>
+        {info.account_label || "Account ID"} <code>({info.account_env})</code>
       </span>
       <input
         value={value}
