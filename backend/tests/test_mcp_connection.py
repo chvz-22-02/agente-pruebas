@@ -79,6 +79,72 @@ def test_queued_commands_do_not_wait_for_the_timeout() -> None:
     asyncio.run(scenario())
 
 
+def test_reconnect_keeps_the_connection_id() -> None:
+    """Reconectar cierra la sesion vieja y registra la nueva bajo el mismo id.
+
+    Una bateria en marcha, las conversaciones guardadas y la UI referencian la
+    conexion por `conn_id`: si cambiara al reconectar, todo eso apuntaria a
+    una conexion muerta.
+    """
+
+    async def scenario() -> None:
+        from app.mcpclient import manager as manager_mod
+        from app.mcpclient.manager import MCPManager
+
+        stopped: list[str] = []
+
+        class FakeConnection:
+            def __init__(self, config: MCPServerConfig, on_frame: Any = None) -> None:
+                self.conn_id = f"mcp_{id(self)}"
+                self.config = config
+                self.server_info = {"name": "fake"}
+                self.tools = ["a", "b"]
+                self.active_transport = "streamable_http"
+                self.alive = False
+
+            @property
+            def is_alive(self) -> bool:
+                return self.alive
+
+            async def start(self) -> dict[str, Any]:
+                self.alive = True
+                return {"conn_id": self.conn_id, "config": {"url": self.config.url}, "tools": self.tools}
+
+            async def stop(self) -> None:
+                stopped.append(self.conn_id)
+                self.alive = False
+
+            def describe(self) -> dict[str, Any]:
+                return {"conn_id": self.conn_id}
+
+        saved = manager_mod.MCPConnection
+        manager_mod.MCPConnection = FakeConnection  # type: ignore[misc]
+        try:
+            manager = MCPManager()
+            conn_id = (await manager.connect(MCPServerConfig(url="https://x/mcp")))["conn_id"]
+            old = manager.get(conn_id)
+            old.alive = False  # se cayo
+            assert manager.alive_ids([conn_id]) == []
+
+            info = await manager.reconnect(conn_id)
+            new = manager.get(conn_id)
+            assert new is not old and new.conn_id == conn_id
+            assert stopped == [conn_id], "la sesion vieja tiene que cerrarse antes"
+            assert manager.alive_ids([conn_id]) == [conn_id]
+            assert info["conn_id"] == conn_id and info["config"]["url"] == "https://x/mcp"
+
+            try:
+                await manager.reconnect("mcp_inexistente")
+            except MCPConnectionError as exc:
+                assert "no encontrada" in str(exc)
+            else:
+                raise AssertionError("reconectar un id desconocido debe fallar")
+        finally:
+            manager_mod.MCPConnection = saved  # type: ignore[misc]
+
+    asyncio.run(scenario())
+
+
 def test_router_turns_a_dead_server_into_an_observation() -> None:
     """Un MCP caido es un resultado de herramienta con error, no una excepcion.
 

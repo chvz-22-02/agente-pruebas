@@ -78,6 +78,35 @@ class MCPManager:
         await conn.stop()
         return True
 
+    async def reconnect(self, conn_id: str) -> dict[str, Any]:
+        """Levanta de nuevo una conexion caida **con el mismo identificador**.
+
+        Una bateria de evaluacion, las conversaciones guardadas y la UI
+        referencian la conexion por `conn_id`; si al reconectar cambiara, todo
+        eso quedaria apuntando a una conexion muerta. Primero se cierra la
+        vieja del todo -aunque su sesion siguiera medio abierta- y despues se
+        abre otra con la misma configuracion y se registra bajo el mismo id.
+        """
+        async with self._lock:
+            old = self._connections.pop(conn_id, None)
+        if old is None:
+            raise MCPConnectionError(f"Conexion MCP no encontrada: {conn_id}")
+        await old.stop()
+
+        conn = MCPConnection(old.config, on_frame=self._broadcast)
+        conn.conn_id = conn_id
+        description = await conn.start()
+        async with self._lock:
+            self._connections[conn_id] = conn
+        logger.info(
+            "MCP reconectado: %s (%s) via %s con %d herramientas",
+            old.config.url,
+            conn.server_info.get("name"),
+            conn.active_transport,
+            len(conn.tools),
+        )
+        return description
+
     async def disconnect_all(self) -> None:
         async with self._lock:
             conns = list(self._connections.values())

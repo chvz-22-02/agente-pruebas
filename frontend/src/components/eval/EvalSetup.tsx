@@ -41,6 +41,7 @@ const DEFAULT_SIM: RoleConfig = {
   temperature: 0.8,
   // Escribir como un usuario no necesita razonar y en CPU ahorra mucho tiempo.
   thinking: false,
+  system_prompt: "",
 };
 
 const DEFAULT_JUDGE: RoleConfig = {
@@ -51,7 +52,17 @@ const DEFAULT_JUDGE: RoleConfig = {
   // El juicio debe ser reproducible.
   temperature: 0,
   thinking: true,
+  system_prompt: "",
 };
+
+/** Prompts por defecto de los dos agentes, tal y como los sirve el backend. */
+type PromptDefaults = { simulator: string; judge: string; placeholders: string[] };
+
+/** Un prompt identico al de por defecto no es "propio": viaja vacio. */
+function customPrompt(role: RoleConfig, defaultText: string): string {
+  const text = role.system_prompt.trim();
+  return !text || text === defaultText.trim() ? "" : role.system_prompt;
+}
 
 type Stored = {
   personas: string;
@@ -107,6 +118,9 @@ function RoleEditor({
   config,
   agent,
   agentModels,
+  defaultPrompt,
+  placeholders,
+  promptNote,
 }: {
   title: string;
   hint: string;
@@ -115,8 +129,15 @@ function RoleEditor({
   config: BackendConfig | null;
   agent: AgentSettings;
   agentModels: string[];
+  /** Texto del prompt por defecto: se ensena como referencia y se puede copiar para editarlo. */
+  defaultPrompt: string;
+  /** Marcadores que el backend rellena (solo el simulador los tiene). */
+  placeholders?: string[];
+  /** Aviso que aparece en cuanto el prompt deja de ser el de por defecto. */
+  promptNote?: string;
 }) {
   const set = (patch: Partial<RoleConfig>) => onChange({ ...value, ...patch });
+  const isCustom = customPrompt(value, defaultPrompt) !== "";
   const provider = value.sameAsAgent ? agent.provider : value.provider || agent.provider;
   const info = config?.catalog?.find((p) => p.name === provider);
   const suggestions = [
@@ -221,6 +242,41 @@ function RoleEditor({
         </label>
       </div>
       <p className="muted" style={{ margin: "4px 0 0" }}>{hint}</p>
+
+      <details style={{ marginTop: 6 }}>
+        <summary className="muted" style={{ cursor: "pointer" }}>
+          System prompt{" "}
+          {isCustom ? <span className="badge">propio</span> : <span>(el de por defecto)</span>}
+        </summary>
+        <textarea
+          className="prompt-text"
+          value={value.system_prompt}
+          placeholder={defaultPrompt || "cargando el prompt por defecto..."}
+          onChange={(e) => set({ system_prompt: e.target.value })}
+          spellCheck={false}
+        />
+        <div className="row">
+          <button
+            className="tiny"
+            onClick={() => set({ system_prompt: defaultPrompt })}
+            disabled={!defaultPrompt}
+            title="Copia el texto por defecto al editor para modificarlo"
+          >
+            Partir del de por defecto
+          </button>
+          <button className="tiny" onClick={() => set({ system_prompt: "" })} disabled={!value.system_prompt}>
+            Volver al de por defecto
+          </button>
+        </div>
+        {placeholders && placeholders.length > 0 && (
+          <p className="muted" style={{ margin: "4px 0 0" }}>
+            Marcadores que rellena el backend: {placeholders.map((p) => <code key={p} style={{ marginRight: 6 }}>{p}</code>)}
+          </p>
+        )}
+        {promptNote && isCustom && (
+          <p className="muted" style={{ margin: "4px 0 0", color: "var(--warn)" }}>{promptNote}</p>
+        )}
+      </details>
     </div>
   );
 }
@@ -256,10 +312,20 @@ export default function EvalSetup({
   const [excludedPersonas, setExcludedPersonas] = useState<string[]>([]);
   const [runName, setRunName] = useState("");
   const [runExperiment, setRunExperiment] = useState(experiment);
+  const [prompts, setPrompts] = useState<PromptDefaults>({ simulator: "", judge: "", placeholders: [] });
   const fileRef = useRef<HTMLInputElement>(null);
 
   // El experimento de la barra lateral es el punto de partida.
   useEffect(() => setRunExperiment((current) => current || experiment), [experiment]);
+
+  // Los prompts por defecto viven en el backend: se piden una vez para
+  // ensenarlos y para saber cuando el escrito por el usuario es "propio".
+  useEffect(() => {
+    api
+      .get<{ simulator_prompt: string; judge_prompt: string; simulator_placeholders: string[] }>("/api/eval/templates")
+      .then((t) => setPrompts({ simulator: t.simulator_prompt, judge: t.judge_prompt, placeholders: t.simulator_placeholders }))
+      .catch(() => undefined);
+  }, []);
 
   useEffect(() => {
     try {
@@ -333,7 +399,7 @@ export default function EvalSetup({
   const toggle = (list: string[], setList: (v: string[]) => void, id: string) =>
     setList(list.includes(id) ? list.filter((x) => x !== id) : [...list, id]);
 
-  const rolePayload = (role: RoleConfig) => {
+  const rolePayload = (role: RoleConfig, defaultPrompt: string) => {
     const provider = role.sameAsAgent ? agent.provider : role.provider || agent.provider;
     return {
       provider,
@@ -342,6 +408,7 @@ export default function EvalSetup({
       api_key: apiKeys[provider] || null,
       temperature: role.temperature,
       thinking: role.thinking,
+      system_prompt: customPrompt(role, defaultPrompt),
     };
   };
 
@@ -362,8 +429,8 @@ export default function EvalSetup({
         system_prompt: agent.systemPrompt,
         max_iterations: agent.maxIterations,
       },
-      simulator: rolePayload(simulator),
-      judge: rolePayload(judge),
+      simulator: rolePayload(simulator, prompts.simulator),
+      judge: rolePayload(judge, prompts.judge),
       mcp_conn_ids: mcp.connIds,
       // Vacio = todos; se manda la lista solo si hay descartes.
       case_ids: excludedCases.length ? includedCases.map((c) => c.id) : [],
@@ -570,6 +637,8 @@ export default function EvalSetup({
           config={config}
           agent={agent}
           agentModels={agentModels}
+          defaultPrompt={prompts.simulator}
+          placeholders={prompts.placeholders}
         />
         <RoleEditor
           title="Evaluador"
@@ -579,6 +648,8 @@ export default function EvalSetup({
           config={config}
           agent={agent}
           agentModels={agentModels}
+          defaultPrompt={prompts.judge}
+          promptNote="Con un prompt propio no hay rubrica ni nota: la consulta queda como 'evaluado' y se guarda la respuesta del evaluador tal cual. La tabla de criterios se desactiva."
         />
       </section>
 

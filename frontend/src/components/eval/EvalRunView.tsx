@@ -121,6 +121,11 @@ function ResultDetail({
         {result.repetition > 1 && <span className="badge">#{result.repetition}</span>}
         <StatusBadge status={result.status} />
         {result.score !== null && <span className="badge">nota {pct(result.score)}</span>}
+        {result.custom_judge && (
+          <span className="badge" title="El evaluador uso un prompt propio: no hay rubrica ni nota">
+            prompt propio · sin nota
+          </span>
+        )}
         <div style={{ flex: 1 }} />
         {result.conversation_id && finished && (
           <button
@@ -141,15 +146,19 @@ function ResultDetail({
       {result.status === "running" && (
         <p className="muted">
           <span className="spin" style={{ display: "inline-block", marginRight: 6 }} />
-          Turno {result.turn ?? 1}: {PHASE_LABEL[result.phase || ""] || "en curso"}...
+          {result.phase === "esperando"
+            ? `${PHASE_LABEL.esperando}...`
+            : `Turno ${result.turn ?? 1}: ${PHASE_LABEL[result.phase || ""] || "en curso"}...`}
         </p>
       )}
       {result.error && <div className="error-box">{result.error}</div>}
 
       {finished && result.resumen && (
         <div className="eval-verdict">
-          <div className="muted" style={{ marginBottom: 2 }}>Veredicto del evaluador</div>
-          {result.resumen}
+          <div className="muted" style={{ marginBottom: 2 }}>
+            {result.custom_judge ? "Respuesta del evaluador (prompt propio)" : "Veredicto del evaluador"}
+          </div>
+          <div style={{ whiteSpace: "pre-wrap" }}>{result.resumen}</div>
         </div>
       )}
 
@@ -164,7 +173,8 @@ function ResultDetail({
         </div>
       )}
 
-      {result.items && result.items.length > 0 && (
+      {/* Con un prompt propio del evaluador no hay rubrica que mostrar. */}
+      {!result.custom_judge && result.items && result.items.length > 0 && (
         <Criteria items={result.items} failedMandatory={result.failed_mandatory || []} />
       )}
 

@@ -659,6 +659,9 @@ se ajustan en la UI (6 y 0,7 por defecto).
   cambia los juicios, nunca la aritmética.
 * Si el evaluador no devuelve un JSON válido tras un reintento, la consulta queda en `error`
   (no suspende): es un fallo del instrumento, no del agente.
+* Con un **system prompt propio del evaluador** no se le exige JSON ni se le reprocha no darlo:
+  la consulta queda como `evaluado`, sin nota ni aprobado, con su respuesta íntegra. Solo se
+  conservan las comprobaciones deterministas.
 
 ### En la UI
 
@@ -671,6 +674,15 @@ se ajustan en la UI (6 y 0,7 por defecto).
    que el chat. El simulador y el evaluador pueden usar el mismo modelo o cualquier otro del
    catálogo (también de nube, con la clave guardada en *Modelo*). Por defecto el simulador va
    sin razonamiento (más rápido y natural) y el evaluador con temperatura 0.
+   Cada uno tiene su **system prompt** editable (desplegable *System prompt*): vacío significa
+   el de por defecto, *Partir del de por defecto* lo copia al editor para retocarlo, y un texto
+   idéntico al original cuenta como el de por defecto. El del simulador es una plantilla con
+   marcadores que rellena el backend por consulta (`{persona_nombre}`, `{persona_descripcion}`,
+   `{goal}`, `{ambiguedad}`, `{fin}`); el del evaluador recibe después el caso, la rúbrica y la
+   transcripción como mensaje de usuario. **Ojo con el del evaluador**: el contrato JSON de la
+   rúbrica vive en ese prompt, así que con uno propio no hay rúbrica ni nota — la consulta queda
+   como `evaluado`, se guarda la respuesta del evaluador tal cual y la tabla de criterios se
+   desactiva. Los prompts propios se registran en MLflow (`evaluation/*_prompt.txt`).
 4. **MLflow**: experimento (se crea si no existe) y nombre de la ejecución.
 
 Mientras corre se ve la conversación en vivo (persona, agente y cada llamada al MCP); al cerrar
@@ -680,12 +692,28 @@ con el razonamiento y las tramas JSON-RPC.
 
 La ejecución corre **en el backend**, no en el navegador: recargar la página no la detiene y la
 UI se reengancha sola. Se puede cancelar (lo ya evaluado se conserva). Si se reinicia el
-backend, las que estaban en marcha quedan como `interrumpida`. Si el **servidor MCP se cae** a
-media batería, la ejecución se detiene con estado `error` y el motivo a la vista, en vez de
-seguir con los casos restantes sin herramientas: reconecta el MCP y relanza lo que falte
-marcando solo esas consultas. Orientativo en CPU: cada turno cuesta una o dos llamadas al
-modelo del agente más una del simulador, y cada caso una del evaluador, así que un caso de 3
-turnos con modelos de 4–8 B tarda varios minutos.
+backend, las que estaban en marcha quedan como `interrumpida`. Orientativo en CPU: cada turno
+cuesta una o dos llamadas al modelo del agente más una del simulador, y cada caso una del
+evaluador, así que un caso de 3 turnos con modelos de 4–8 B tarda varios minutos.
+
+Dos cosas que una batería larga se encuentra sí o sí, y cómo se tratan:
+
+* **El endpoint se satura.** Los *free tiers* devuelven `429` cuando se agota el cupo y `5xx`
+  cuando están sobrecargados; cada proveedor ya reintenta por su cuenta, pero si aun así el
+  fallo llega hasta la evaluación (en cualquiera de los tres papeles), la consulta **no se da por
+  suspendida**: se espera **10 minutos** y se repite desde el principio, con una conversación
+  nueva. Si el segundo intento también se satura, la batería **se detiene** con estado `error`
+  y el motivo a la vista — seguir encadenando consultas contra un endpoint que no responde solo
+  produce fallos que no dicen nada del agente. En la UI la consulta aparece como *endpoint
+  saturado: se repite en 10 min* y el intento abandonado queda en la sesión, con su conversación
+  cerrada.
+* **El servidor MCP se cae.** Pasa justo con lo anterior: mientras el agente está atascado
+  minutos esperando al proveedor, el MCP cierra la sesión por inactividad, y la siguiente
+  consulta se ejecutaría **sin herramientas** y "aprobaría" sin haber probado nada. Por eso
+  **antes de cada consulta** se comprueba que los MCP declarados siguen vivos y, si alguno no,
+  se **reconecta con el mismo identificador**: primero se cierra del todo la sesión vieja
+  (aunque siguiera medio abierta) y después se abre otra con la misma configuración. Queda un
+  aviso en el registro de la ejecución. Solo si la reconexión falla se detiene la batería.
 
 ### Qué queda en MLflow
 
@@ -694,9 +722,10 @@ Se reutiliza la jerarquía del chat, con etiquetas extra:
 ```
 Experimento
   Run padre   -> la ejecución          (tags: kind=evaluation, eval_run_id, eval_suite)
-     params:     modelos de agente/simulador/evaluador, MCP, hashes de los dos ficheros
+     params:     modelos de agente/simulador/evaluador (y si llevan prompt propio), MCP, hashes de los ficheros
      metrics:    eval.pass_rate, eval.avg_score, eval.passed/failed/errors, tokens.agent/simulator/judge
-     artifacts:  evaluation/personas.json, consultas.json, summary.json, results.json (tabla)
+     artifacts:  evaluation/personas.json, consultas.json, summary.json, results.json (tabla),
+                 simulator_prompt.txt / judge_prompt.txt si se cambiaron
     Run hijo  -> consulta × repetición  (tags: eval_case_id, eval_persona_id, eval.status)
      metrics:    eval.score, eval.passed, eval.turns, sim.*, judge.*, agent.*
      artifacts:  evaluation/result.json (transcripción + rúbrica), judge.json (prompt y respuesta),
@@ -800,9 +829,14 @@ scripts/
   completo a una conexión que ya no atiende a nadie.
 * **La evaluación distingue quién canceló.** `Task.cancelling()` separa una cancelación real de
   la batería de un `CancelledError` que sube desde más abajo; lo segundo se registra como
-  **error**, con su motivo, en lugar de hacerlo pasar por una parada voluntaria. Y si se
-  declararon servidores MCP pero ya no queda ninguno vivo, la batería se detiene ahí: los casos
-  restantes se ejecutarían sin herramientas y "aprobarían" sin haber probado nada.
+  **error**, con su motivo, en lugar de hacerlo pasar por una parada voluntaria.
+* **El código HTTP del proveedor viaja con el error.** El bucle del agente convierte cualquier
+  excepción en texto para no tumbar el servidor, pero el evento `error` lleva además el
+  `status`; con él la evaluación distingue un fallo transitorio (`429`, `5xx`: esperar y
+  repetir) de uno del agente (juzgar la conversación truncada).
+* **Reconectar un MCP conserva su `conn_id`.** `MCPManager.reconnect` cierra la conexión vieja,
+  abre otra con la misma configuración y la registra bajo el mismo identificador, porque la
+  batería en marcha, las conversaciones guardadas y la UI apuntan a la conexión por ese id.
 * **El run de MLflow se crea con la primera interacción**, no al crear la sesión. Una sesión
   que se abre y no se usa no deja rastro en el experimento.
 * **Vaciado antes de purgar.** MLflow exporta las trazas en segundo plano; al borrar una

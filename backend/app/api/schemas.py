@@ -97,6 +97,9 @@ class EvalRoleModel(BaseModel):
     temperature: float | None = None
     thinking: bool | None = None
     max_tokens: int | None = None
+    # Vacio => el prompt por defecto del papel. En el evaluador, un prompt
+    # propio desactiva la rubrica y la nota: solo se guarda su respuesta.
+    system_prompt: str = ""
 
 
 class EvalAgentModel(EvalRoleModel):

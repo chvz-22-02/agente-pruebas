@@ -383,6 +383,16 @@ hr.sep { border: none; border-top: 1px solid var(--line); margin: 14px 0; }
   tab-size: 2;
   margin-bottom: 8px;
 }
+.prompt-text {
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.45;
+  min-height: 180px;
+  width: 100%;
+  white-space: pre-wrap;
+  margin: 6px 0;
+  resize: vertical;
+}
 .eval-pick {
   display: flex;
   align-items: center;

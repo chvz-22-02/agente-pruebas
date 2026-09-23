@@ -393,12 +393,254 @@ async def _mcp_gone(tmp_path: Path) -> None:
 
         run = await repo.get_eval_run(job.id)
         assert run is not None and run["status"] == "error", run["status"]
-        assert "no queda ninguno activo" in run["error"], run["error"]
+        assert "no se pudo reconectar" in run["error"], run["error"]
         # Se avisa en el registro en vivo, y no se ejecuta ningun caso.
         assert any(e["type"] == "log" and e.get("level") == "error" for e in events)
         assert not any(e["type"] == "item_start" for e in events)
     finally:
         await db.close()
+
+
+def test_dead_mcp_is_reconnected_before_each_case(tmp_path: Path) -> None:
+    """Un MCP caido entre consultas se levanta de nuevo, con el mismo id, y se sigue."""
+    asyncio.run(_mcp_reconnect(tmp_path))
+
+
+async def _mcp_reconnect(tmp_path: Path) -> None:
+    from app.evals import runner as runner_mod
+    from app.evals.runner import AgentModel, EvalRequest, RoleModel, eval_manager
+    from app.llm import registry
+    from app.store import repository as repo
+    from app.store.db import db
+
+    class FakeManager:
+        """Primera consulta: la conexion esta caida. Tras reconectar, viva."""
+
+        def __init__(self) -> None:
+            self.alive = False
+            self.reconnected: list[str] = []
+
+        def alive_ids(self, conn_ids: list[str] | None = None) -> list[str]:
+            return list(conn_ids or []) if self.alive else []
+
+        async def reconnect(self, conn_id: str) -> dict[str, Any]:
+            self.reconnected.append(conn_id)
+            self.alive = True
+            return {"config": {"url": "https://mcp.ejemplo/mcp"}, "tools": [{"name": "a"}, {"name": "b"}]}
+
+        def get(self, conn_id: str) -> Any:
+            raise AssertionError("el agente guionizado no usa herramientas")
+
+    fake = FakeManager()
+    registry.PROVIDERS.update({"s_agent": AgentLLM, "s_sim": SimulatorLLM, "s_judge": JudgeLLM})  # type: ignore[dict-item]
+    saved, runner_mod.mcp_manager = runner_mod.mcp_manager, fake  # type: ignore[assignment]
+    db.path = str(tmp_path / "reconnect.sqlite3")
+    await db.connect()
+    try:
+        job = await eval_manager.start(
+            EvalRequest(
+                personas_json=PERSONAS,
+                consultas_json=CASES,
+                agent=AgentModel(provider="s_agent", base_url="http://scripted", model="agente"),
+                simulator=RoleModel(provider="s_sim", base_url="http://scripted", model="simulador"),
+                judge=RoleModel(provider="s_judge", base_url="http://scripted", model="juez"),
+                mcp_conn_ids=["mcp_caido"],
+                case_ids=["PG-01", "PG-02"],
+            )
+        )
+        events = [e async for e in eval_manager.stream(job, 0)]
+        run = await repo.get_eval_run(job.id)
+        assert run is not None and run["status"] == "done", (run["status"], run["error"])
+        # Se reconecto una vez (antes de la primera consulta) y se aviso.
+        assert fake.reconnected == ["mcp_caido"], fake.reconnected
+        warnings = [e["message"] for e in events if e["type"] == "log" and e.get("level") == "warn"]
+        assert any("reconectada" in w and "2 herramientas" in w for w in warnings), warnings
+        assert sum(1 for e in events if e["type"] == "item_end") == 2
+    finally:
+        runner_mod.mcp_manager = saved  # type: ignore[assignment]
+        await db.close()
+
+
+class SaturatedThenFineAgentLLM(_Scripted):
+    """La primera consulta agota los reintentos del proveedor; la repeticion va bien."""
+
+    calls = 0
+
+    async def chat(self, messages: list[dict[str, Any]], tools: list[ToolSpec] | None = None,
+                   **kwargs: Any) -> LLMResponse:
+        from app.llm.openai_compat_provider import LLMRequestError
+
+        type(self).calls += 1
+        if type(self).calls == 1:
+            raise LLMRequestError(504, "el endpoint gratuito de NVIDIA esta saturado", {"model": "x"})
+        return LLMResponse(content=AGENT_ANSWER, usage=Usage(100, 20, 120), latency_ms=5.0)
+
+
+class AlwaysSaturatedAgentLLM(_Scripted):
+    async def chat(self, messages: list[dict[str, Any]], tools: list[ToolSpec] | None = None,
+                   **kwargs: Any) -> LLMResponse:
+        from app.llm.openai_compat_provider import LLMRequestError
+
+        raise LLMRequestError(429, "Too Many Requests", {"model": "x"})
+
+
+def test_saturated_endpoint_waits_and_retries_the_case(tmp_path: Path) -> None:
+    """Regresion: un 504 de NVIDIA truncaba la conversacion y la daba por suspendida."""
+    asyncio.run(_saturation_retry(tmp_path))
+
+
+async def _saturation_retry(tmp_path: Path) -> None:
+    from app.evals import runner as runner_mod
+    from app.evals.runner import AgentModel, EvalRequest, RoleModel, eval_manager
+    from app.llm import registry
+    from app.store import repository as repo
+    from app.store.db import db
+
+    SaturatedThenFineAgentLLM.calls = 0
+    registry.PROVIDERS.update({"s_sat": SaturatedThenFineAgentLLM, "s_sim": SimulatorLLM, "s_judge": JudgeLLM})  # type: ignore[dict-item]
+    saved_wait, runner_mod.SATURATION_WAIT_S = runner_mod.SATURATION_WAIT_S, 0.0
+    db.path = str(tmp_path / "saturado.sqlite3")
+    await db.connect()
+    try:
+        job = await eval_manager.start(
+            EvalRequest(
+                personas_json=PERSONAS,
+                consultas_json=CASES,
+                agent=AgentModel(provider="s_sat", base_url="http://scripted", model="agente"),
+                simulator=RoleModel(provider="s_sim", base_url="http://scripted", model="simulador"),
+                judge=RoleModel(provider="s_judge", base_url="http://scripted", model="juez"),
+                case_ids=["PG-01"],
+            )
+        )
+        events = [e async for e in eval_manager.stream(job, 0)]
+
+        run = await repo.get_eval_run(job.id)
+        assert run is not None and run["status"] == "done", (run["status"], run["error"])
+        result = (await repo.list_eval_results(job.id))[0]
+        # La consulta se repitio y acabo juzgada; el intento saturado no cuenta.
+        assert result["status"] == "failed" and result["score"] is not None, result
+        assert result["turns"] == 1 and "504" not in (result["error"] or "")
+        assert any(e["type"] == "item_phase" and e.get("phase") == "esperando" for e in events)
+        warnings = [e["message"] for e in events if e["type"] == "log" and e.get("level") == "warn"]
+        assert any("504" in w and "se repite" in w for w in warnings), warnings
+        # Un solo item_end: el primer intento no se cierra como resultado.
+        assert sum(1 for e in events if e["type"] == "item_end") == 1
+        # Y la conversacion abandonada queda en la sesion, distinguible por el titulo.
+        titles = sorted(c["title"] for c in await repo.list_conversations(job.session_id))
+        assert any("intento 2" in t for t in titles), titles
+    finally:
+        runner_mod.SATURATION_WAIT_S = saved_wait
+        await db.close()
+
+
+def test_second_saturation_stops_the_battery(tmp_path: Path) -> None:
+    asyncio.run(_saturation_stop(tmp_path))
+
+
+async def _saturation_stop(tmp_path: Path) -> None:
+    from app.evals import runner as runner_mod
+    from app.evals.runner import AgentModel, EvalRequest, RoleModel, eval_manager
+    from app.llm import registry
+    from app.store import repository as repo
+    from app.store.db import db
+
+    registry.PROVIDERS.update({"s_429": AlwaysSaturatedAgentLLM, "s_sim": SimulatorLLM, "s_judge": JudgeLLM})  # type: ignore[dict-item]
+    saved_wait, runner_mod.SATURATION_WAIT_S = runner_mod.SATURATION_WAIT_S, 0.0
+    db.path = str(tmp_path / "saturado2.sqlite3")
+    await db.connect()
+    try:
+        job = await eval_manager.start(
+            EvalRequest(
+                personas_json=PERSONAS,
+                consultas_json=CASES,
+                agent=AgentModel(provider="s_429", base_url="http://scripted", model="agente"),
+                simulator=RoleModel(provider="s_sim", base_url="http://scripted", model="simulador"),
+                judge=RoleModel(provider="s_judge", base_url="http://scripted", model="juez"),
+            )
+        )
+        [e async for e in eval_manager.stream(job, 0)]
+
+        run = await repo.get_eval_run(job.id)
+        assert run is not None and run["status"] == "error", run["status"]
+        assert "429" in run["error"] and "segundo intento" in run["error"], run["error"]
+        results = await repo.list_eval_results(job.id)
+        # La primera queda en error con el motivo; las demas no se ejecutan.
+        assert results[0]["status"] == "error" and "429" in results[0]["error"]
+        assert {r["status"] for r in results[1:]} == {"error"}
+        assert all(not r["conversation_id"] for r in results[1:])
+    finally:
+        runner_mod.SATURATION_WAIT_S = saved_wait
+        await db.close()
+
+
+class FreeTextJudgeLLM(_Scripted):
+    """Un evaluador con prompt propio no tiene por que devolver JSON."""
+
+    async def chat(self, messages: list[dict[str, Any]], tools: list[ToolSpec] | None = None,
+                   **kwargs: Any) -> LLMResponse:
+        assert messages[0]["content"] == "Eres un critico literario. Valora la conversacion en un parrafo."
+        return LLMResponse(content="Una conversacion correcta pero sin fuentes.", usage=Usage(30, 10, 40), latency_ms=2.0)
+
+
+def test_custom_judge_prompt_disables_rubric_and_score(tmp_path: Path) -> None:
+    asyncio.run(_custom_judge(tmp_path))
+
+
+async def _custom_judge(tmp_path: Path) -> None:
+    from app.evals.runner import AgentModel, EvalRequest, RoleModel, eval_manager
+    from app.llm import registry
+    from app.store import repository as repo
+    from app.store.db import db
+
+    registry.PROVIDERS.update({"s_agent": AgentLLM, "s_sim": SimulatorLLM, "s_free": FreeTextJudgeLLM})  # type: ignore[dict-item]
+    db.path = str(tmp_path / "juezpropio.sqlite3")
+    await db.connect()
+    try:
+        job = await eval_manager.start(
+            EvalRequest(
+                personas_json=PERSONAS,
+                consultas_json=CASES,
+                agent=AgentModel(provider="s_agent", base_url="http://scripted", model="agente"),
+                simulator=RoleModel(provider="s_sim", base_url="http://scripted", model="simulador"),
+                judge=RoleModel(
+                    provider="s_free", base_url="http://scripted", model="juez",
+                    system_prompt="Eres un critico literario. Valora la conversacion en un parrafo.",
+                ),
+                case_ids=["PG-01"],
+            )
+        )
+        events = [e async for e in eval_manager.stream(job, 0)]
+        result = (await repo.list_eval_results(job.id))[0]
+
+        assert result["status"] == "evaluated", result["status"]
+        assert result["score"] is None and result["passed"] is None
+        assert result["verdict"]["custom_prompt"] is True
+        assert result["verdict"]["resumen"] == "Una conversacion correcta pero sin fuentes."
+        # Sin rubrica: solo quedan las comprobaciones deterministas.
+        assert all(i["origen"] == "determinista" for i in result["items"]), result["items"]
+        end = next(e for e in events if e["type"] == "item_end")
+        assert end["custom_judge"] is True and end["status"] == "evaluated"
+        run = await repo.get_eval_run(job.id)
+        assert run is not None and run["summary"]["evaluated"] == 1 and run["summary"]["failed"] == 0
+    finally:
+        await db.close()
+
+
+def test_simulator_prompt_template_is_rendered() -> None:
+    from app.evals.simulator import DEFAULT_PROMPT, build_system_prompt
+
+    spec = parse_suite(PERSONAS, CASES)
+    persona, case = spec.personas[0], spec.cases[0]
+
+    default = build_system_prompt(persona, case)
+    assert "{persona_nombre}" not in default and persona.nombre in default and case.goal in default
+    assert "<<FIN>>" in default
+
+    custom = build_system_prompt(persona, case, "Eres {persona_nombre} y quieres: {goal}. Cierra con {fin}. {llave suelta}")
+    assert custom == f"Eres {persona.nombre} y quieres: {case.goal}. Cierra con <<FIN>>. {{llave suelta}}"
+    # Vacio o solo espacios => la plantilla por defecto.
+    assert build_system_prompt(persona, case, "   ") == default
+    assert DEFAULT_PROMPT.count("{fin}") == 3
 
 
 class EagerFinSimulatorLLM(_Scripted):
