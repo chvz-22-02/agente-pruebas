@@ -60,6 +60,11 @@ TRANSCRIPT_RESULT_CHARS = 4000
 WAIT_EVENTS_S = 15.0
 # Ejecuciones terminadas cuyos eventos se conservan en memoria.
 KEEP_FINISHED_JOBS = 10
+# Codigos con los que un proveedor dice "ahora no": limite de peticiones o
+# endpoint saturado. Los proveedores ya reintentan por su cuenta; si aun asi
+# llegan hasta aqui, se deja respirar al endpoint y se repite la consulta.
+TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
+SATURATION_WAIT_S = 600.0
 
 
 # ------------------------------------------------------------ configuracion -
@@ -75,6 +80,8 @@ class RoleModel:
     temperature: float | None = None
     thinking: bool | None = None
     max_tokens: int | None = None
+    # Vacio => el prompt por defecto del papel.
+    system_prompt: str = ""
 
     def resolved(self) -> dict[str, Any]:
         return {
@@ -85,6 +92,7 @@ class RoleModel:
             "thinking": self.thinking,
             "max_tokens": self.max_tokens,
             "has_api_key": bool(self.api_key),
+            "custom_prompt": bool(self.system_prompt.strip()),
         }
 
 
@@ -123,6 +131,24 @@ class EvalRequest:
 
 class EvalConfigError(ValueError):
     """La peticion no se puede ejecutar (JSON invalido, matriz vacia...)."""
+
+
+class EndpointSaturated(Exception):
+    """El proveedor de un papel agoto sus reintentos con un codigo transitorio."""
+
+    def __init__(self, role: str, status: int, detail: str, conversation_id: str = "") -> None:
+        self.role = role
+        self.status = status
+        self.conversation_id = conversation_id
+        super().__init__(
+            f"El proveedor del {role} respondio {status} (limite de peticiones o endpoint "
+            f"saturado): {detail}"
+        )
+
+
+def _transient_status(exc: BaseException) -> int | None:
+    status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
+    return status if status in TRANSIENT_STATUSES else None
 
 
 # ---------------------------------------------------------------- ejecucion -
@@ -177,6 +203,78 @@ class EvalJob:
         if self.task and not self.task.done():
             self.task.cancel()
 
+    async def _ensure_mcp(self) -> str:
+        """Antes de cada consulta, los MCP declarados tienen que estar vivos.
+
+        Un endpoint saturado deja al agente atascado minutos, y en ese rato el
+        servidor MCP cierra la sesion por inactividad: la siguiente consulta
+        se ejecutaria sin herramientas y "aprobaria" sin haber probado nada.
+        Se reconecta con el mismo identificador -cerrando antes la sesion
+        vieja aunque siguiera medio abierta- y se sigue. Devuelve el motivo
+        si no se pudo, y entonces la bateria se detiene.
+        """
+        declared = self.request.mcp_conn_ids
+        if not declared:
+            return ""
+        alive = set(mcp_manager.alive_ids(declared))
+        for conn_id in declared:
+            if conn_id in alive:
+                continue
+            try:
+                info = await mcp_manager.reconnect(conn_id)
+            except Exception as exc:  # noqa: BLE001 - el motivo va a la UI
+                return (
+                    f"Se perdio la conexion con el servidor MCP ({conn_id}) y no se pudo "
+                    f"reconectar: {type(exc).__name__}: {exc}. Los casos que faltan se "
+                    "ejecutarian sin herramientas, asi que se detiene aqui."
+                )
+            url = (info.get("config") or {}).get("url", "")
+            message = (
+                f"La conexion MCP con {url or conn_id} estaba caida: reconectada, "
+                f"{len(info.get('tools') or [])} herramientas."
+            )
+            logger.warning(message)
+            self.emit("log", level="warn", message=message)
+        return ""
+
+    async def _run_item_with_retry(self, index: int, item: EvalItemSpec) -> None:
+        """Un endpoint saturado no suspende la consulta: se espera y se repite.
+
+        Si el segundo intento tambien se satura, se propaga y la bateria se
+        detiene: seguir encadenando consultas contra un endpoint que no
+        responde solo produce fallos que no dicen nada del agente.
+        """
+        try:
+            await self._run_item(index, item)
+        except EndpointSaturated as first:
+            await self._abandon_attempt(first)
+            minutes = int(SATURATION_WAIT_S // 60)
+            message = (
+                f"{first} Se espera {minutes} min y se repite la consulta {item.case.id} desde "
+                "el principio; si vuelve a fallar, se detiene la bateria."
+            )
+            logger.warning("Evaluacion %s: %s", self.id, message)
+            self.emit("log", level="warn", message=message)
+            self.emit("item_phase", result_id=self.result_ids[index], phase="esperando", turn=0)
+            await asyncio.sleep(SATURATION_WAIT_S)
+            try:
+                await self._run_item(index, item, attempt=2)
+            except EndpointSaturated as second:
+                await self._abandon_attempt(second)
+                raise EndpointSaturated(
+                    second.role,
+                    second.status,
+                    f"{second} Tambien en el segundo intento, tras esperar {minutes} min.",
+                ) from second
+
+    async def _abandon_attempt(self, exc: EndpointSaturated) -> None:
+        """La conversacion del intento fallido se cierra; la siguiente empieza de cero."""
+        if not exc.conversation_id:
+            return
+        await repo.cancel_running_interactions(self.session_id)
+        await tracker.close_conversation_run(exc.conversation_id)
+        self._current_conv = ""
+
     # ---------------------------------------------------------------- run ---
     async def run(self) -> None:
         final_status = "done"
@@ -186,20 +284,44 @@ class EvalJob:
             for index, item in enumerate(self.items):
                 if self.cancel_requested:
                     break
+                if lost := await self._ensure_mcp():
+                    final_status, error = "error", lost
+                    logger.error("Evaluacion %s detenida: %s", self.id, lost)
+                    self.emit("log", level="error", message=lost)
+                    break
                 try:
-                    await self._run_item(index, item)
+                    await self._run_item_with_retry(index, item)
+                except EndpointSaturated as exc:
+                    final_status, error = "error", str(exc)
+                    logger.error("Evaluacion %s detenida: %s", self.id, error)
+                    self.emit("log", level="error", message=error)
+                    await self._item_failed(index, item, error)
+                    break
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - falla el caso, no la bateria
                     logger.exception("Caso %s fallido", self.result_ids[index])
                     await self._item_failed(index, item, f"{type(exc).__name__}: {exc}")
         except asyncio.CancelledError:
-            final_status = "cancelled"
-            logger.info("Evaluacion %s cancelada", self.id)
-            # Se consume la cancelacion para poder cerrar SQLite y MLflow.
+            # `cancelling()` distingue una cancelacion de verdad de esta tarea
+            # de un CancelledError que sube desde mas abajo. Lo segundo es un
+            # fallo -no un "el usuario pulso detener"- y hacerlo pasar por una
+            # cancelacion deja la bateria a medias sin que nadie se entere.
             task = asyncio.current_task()
-            if task is not None and hasattr(task, "uncancel"):
-                task.uncancel()
+            if self.cancel_requested or (task is not None and task.cancelling()):
+                final_status = "cancelled"
+                logger.info("Evaluacion %s cancelada", self.id)
+                # Se consume la cancelacion para poder cerrar SQLite y MLflow.
+                if task is not None:
+                    task.uncancel()
+            else:
+                final_status = "error"
+                error = (
+                    "Cancelacion inesperada a mitad de la ejecucion; nadie pidio detenerla. "
+                    "Suele ser una conexion (MCP o proveedor) que se cae bajo los pies del agente."
+                )
+                logger.error("Evaluacion %s: %s", self.id, error)
+                self.emit("log", level="error", message=error)
         except Exception as exc:  # noqa: BLE001 - se reporta en la UI y en SQLite
             logger.exception("Evaluacion %s fallida", self.id)
             final_status = "error"
@@ -270,12 +392,23 @@ class EvalJob:
                     "simulator.provider": simulator["provider"],
                     "simulator.model": simulator["model"],
                     "simulator.thinking": simulator["thinking"],
+                    "simulator.custom_prompt": simulator["custom_prompt"],
                     "judge.provider": judge["provider"],
                     "judge.model": judge["model"],
                     "judge.thinking": judge["thinking"],
+                    "judge.custom_prompt": judge["custom_prompt"],
                     "mcp_urls": ", ".join(mcp_urls) or "(ninguno)",
                 },
             )
+            # Un prompt propio forma parte de lo que se ejecuto: se guarda entero.
+            if simulator["custom_prompt"]:
+                await tracker.log_text(
+                    self.parent_run_id, "evaluation/simulator_prompt.txt", req.simulator.system_prompt
+                )
+            if judge["custom_prompt"]:
+                await tracker.log_text(
+                    self.parent_run_id, "evaluation/judge_prompt.txt", req.judge.system_prompt
+                )
             # Los ficheros tal cual se ejecutaron: la bateria es reproducible desde MLflow.
             await tracker.log_text(self.parent_run_id, "evaluation/personas.json", req.personas_json)
             await tracker.log_text(self.parent_run_id, "evaluation/consultas.json", req.consultas_json)
@@ -293,12 +426,14 @@ class EvalJob:
         }
 
     # ------------------------------------------------------------ un caso ---
-    async def _run_item(self, index: int, item: EvalItemSpec) -> None:
+    async def _run_item(self, index: int, item: EvalItemSpec, attempt: int = 1) -> None:
         req = self.request
         result_id = self.result_ids[index]
         case, persona = item.case, item.persona
         started = time.perf_counter()
         suffix = f" #{item.repetition}" if req.repetitions > 1 else ""
+        if attempt > 1:
+            suffix += f" · intento {attempt}"
         title = f"[eval] {case.id} · {persona.id}{suffix}"
 
         agent_cfg = req.agent.resolved()
@@ -345,6 +480,7 @@ class EvalJob:
             temperature=req.simulator.temperature,
             thinking=req.simulator.thinking,
             max_tokens=req.simulator.max_tokens,
+            system_prompt=req.simulator.system_prompt or None,
         )
 
         transcript: list[dict[str, Any]] = []
@@ -366,7 +502,12 @@ class EvalJob:
                 text, source = case.consulta_inicial.strip(), "guion"
             else:
                 self.emit("item_phase", result_id=result_id, phase="simulando", turn=turn)
-                sim_turn = await simulator.next_message(dialogue, turn, item.max_turns)
+                try:
+                    sim_turn = await simulator.next_message(dialogue, turn, item.max_turns)
+                except Exception as exc:
+                    if status := _transient_status(exc):
+                        raise EndpointSaturated("simulador", status, str(exc), conv_id) from exc
+                    raise
                 sim_calls += 1
                 sim_usage = sim_usage.merge(sim_turn.usage)
                 sim_latency += sim_turn.latency_ms
@@ -404,6 +545,10 @@ class EvalJob:
             for key, value in (entry.get("metrics") or {}).items():
                 if isinstance(value, (int, float)):
                     agent_totals[key] = agent_totals.get(key, 0.0) + float(value)
+            if entry.get("error_status") in TRANSIENT_STATUSES:
+                # No es un fallo del agente: es el endpoint que no responde.
+                # Juzgar una conversacion truncada por eso no mide nada.
+                raise EndpointSaturated("agente", entry["error_status"], entry["error"], conv_id)
             if entry["error"]:
                 end_reason = "error_agente"
                 break
@@ -425,23 +570,36 @@ class EvalJob:
             temperature=req.judge.temperature if req.judge.temperature is not None else 0.0,
             thinking=req.judge.thinking,
             max_tokens=req.judge.max_tokens,
+            system_prompt=req.judge.system_prompt or None,
         )
         judge_error = ""
         try:
             outcome = await judge.evaluate(case, persona, transcript, checks)
             judge_error = outcome.error
         except Exception as exc:  # noqa: BLE001 - un evaluador caido no tumba la bateria
+            if transient := _transient_status(exc):
+                raise EndpointSaturated("evaluador", transient, str(exc), conv_id) from exc
             logger.exception("Fallo del evaluador en %s", result_id)
             outcome = JudgeOutcome(verdict=None, error=f"{type(exc).__name__}: {exc}")
             judge_error = outcome.error
 
-        items = judged_items(case, outcome.verdict) + checks
-        agg = aggregate(items, item.threshold)
-        if judge_error:
-            status, score, passed = "error", None, None
+        agg: dict[str, Any] | None
+        if judge.custom:
+            # Con un prompt propio no hay contrato JSON, luego no hay rubrica ni
+            # nota: quedan las comprobaciones deterministas y la respuesta del
+            # evaluador tal cual la escribio.
+            items = checks
+            agg = None
+            status = "error" if judge_error else "evaluated"
+            score, passed = None, None
         else:
-            status = "passed" if agg["passed"] else "failed"
-            score, passed = agg["score"], agg["passed"]
+            items = judged_items(case, outcome.verdict) + checks
+            agg = aggregate(items, item.threshold)
+            if judge_error:
+                status, score, passed = "error", None, None
+            else:
+                status = "passed" if agg["passed"] else "failed"
+                score, passed = agg["score"], agg["passed"]
 
         metrics = {
             "turns": agent_turns,
@@ -463,11 +621,12 @@ class EvalJob:
             "judge_attempts": outcome.attempts,
         }
         verdict_doc = {
-            "resumen": (outcome.verdict or {}).get("resumen", ""),
+            "resumen": (outcome.verdict or {}).get("resumen") or (outcome.raw if judge.custom else ""),
             "raw": outcome.verdict,
             "raw_text": outcome.raw if outcome.verdict is None else "",
             "error": judge_error,
             "aggregate": agg,
+            "custom_prompt": judge.custom,
             "judge_model": req.judge.resolved()["model"],
         }
 
@@ -514,7 +673,8 @@ class EvalJob:
             end_reason=end_reason,
             resumen=verdict_doc["resumen"],
             error=judge_error,
-            failed_mandatory=agg["failed_mandatory"],
+            failed_mandatory=agg["failed_mandatory"] if agg else [],
+            custom_judge=judge.custom,
             metrics=metrics,
             mlflow_run_id=run_id,
         )
@@ -552,6 +712,7 @@ class EvalJob:
             "interaction_id": runner.interaction_id,
             "trace_id": "",
             "error": "",
+            "error_status": None,
         }
         try:
             async for event in runner.run():
@@ -578,6 +739,7 @@ class EvalJob:
                     entry["error"] = event.get("error") or entry["error"]
                 elif kind == "error":
                     entry["error"] = event.get("message", "error desconocido")
+                    entry["error_status"] = event.get("status")
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - p.ej. proveedor sin clave: fallo del caso, no de la bateria
@@ -621,7 +783,7 @@ class EvalJob:
         eval_tags: dict[str, str],
         transcript: list[dict[str, Any]],
         items: list[dict[str, Any]],
-        agg: dict[str, Any],
+        agg: dict[str, Any] | None,
         status: str,
         end_reason: str,
         metrics: dict[str, Any],
@@ -660,8 +822,8 @@ class EvalJob:
         )
         numeric = {
             "eval.turns": metrics["turns"],
-            "eval.items_passed": agg["items_passed"],
-            "eval.items_total": agg["items_total"],
+            "eval.items_passed": agg["items_passed"] if agg else sum(1 for i in items if i["cumple"]),
+            "eval.items_total": agg["items_total"] if agg else len(items),
             "eval.wall_ms": metrics["wall_ms"],
             "sim.total_tokens": metrics["sim_total_tokens"],
             "sim.latency_ms": metrics["sim_latency_ms"],
@@ -670,13 +832,19 @@ class EvalJob:
             "agent.total_tokens": metrics["agent_total_tokens"],
             "agent.tool_calls": metrics["tool_calls"],
         }
-        if status != "error":
+        scored = agg is not None and status != "error"
+        if scored:
             numeric["eval.score"] = agg["score"]
             numeric["eval.passed"] = 1.0 if agg["passed"] else 0.0
         await tracker.log_metrics(run_id, numeric)
         await tracker.set_tags(
             run_id,
-            {"eval.status": status, "eval.end_reason": end_reason, "eval.score": agg["score"]},
+            {
+                "eval.status": status,
+                "eval.end_reason": end_reason,
+                "eval.score": agg["score"] if agg else "",
+                "eval.custom_judge": str(agg is None).lower(),
+            },
         )
         await tracker.log_artifact(
             run_id,
@@ -761,7 +929,7 @@ class EvalJob:
                 }
                 for it in items
             ]
-            if status != "error":
+            if scored:
                 feedbacks.append({
                     "name": "eval_score", "value": agg["score"], "source_type": "CODE",
                     "source_id": "agente-pruebas.aggregate",
@@ -792,7 +960,7 @@ class EvalJob:
 
         await tracker.log_metrics(
             self.parent_run_id,
-            {"eval.item_score": agg["score"] if status != "error" else 0.0},
+            {"eval.item_score": agg["score"] if scored else 0.0},
             step=index,
         )
         await tracker.terminate_run(run_id, "FAILED" if status == "error" else "FINISHED")
@@ -842,6 +1010,8 @@ class EvalJob:
             "completed": len(rows),
             "passed": passed,
             "failed": len(judged) - passed,
+            # Con un prompt propio del evaluador no hay nota: solo se cuentan.
+            "evaluated": sum(1 for r in rows if r["status"] == "evaluated"),
             "errors": sum(1 for r in rows if r["status"] == "error"),
             "not_run": len(self.items) - len(rows),
             "pass_rate": round(passed / len(judged), 4) if judged else 0.0,

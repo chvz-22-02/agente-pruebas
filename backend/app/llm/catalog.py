@@ -42,9 +42,12 @@ class ProviderInfo:
     key_env: str = ""
     key_hint: str = ""
     console_url: str = ""
-    # Variable de entorno con el identificador de cuenta, para proveedores cuya
-    # URL lo lleva dentro (Cloudflare). La URL por defecto trae `{account_id}`.
+    # Variable de entorno con el dato que va dentro de la URL, para proveedores
+    # que lo llevan ahi: la cuenta en Cloudflare, la region en AWS. La URL por
+    # defecto trae el marcador `{account_id}` en su sitio.
     account_env: str = ""
+    # Como se llama ese dato en la UI ("Account ID", "Region"...).
+    account_label: str = ""
     supports_pull: bool = False
     models: list[ModelInfo] = field(default_factory=list)
 
@@ -156,6 +159,7 @@ CATALOG: dict[str, ProviderInfo] = {
         key_hint="token con permiso Workers AI",
         console_url="https://dash.cloudflare.com/profile/api-tokens",
         account_env="CLOUDFLARE_ACCOUNT_ID",
+        account_label="Account ID",
         # Solo modelos con function calling: sin herramientas no sirven para
         # probar un MCP. El free tier son 10.000 neuronas al dia (se reinicia a
         # las 00:00 UTC); los mas baratos por token rinden mas conversaciones.
@@ -205,6 +209,41 @@ CATALOG: dict[str, ProviderInfo] = {
                       thinking="always"),
             ModelInfo("mistralai/mistral-nemotron", "Mistral Nemotron", "",
                       "sin razonamiento; dio 500 en la prueba, sin verificar"),
+        ],
+    ),
+    "aws": ProviderInfo(
+        name="aws",
+        label="AWS (Amazon Bedrock)",
+        kind="cloud",
+        needs_api_key=True,
+        # La region va dentro del host. `{account_id}` se rellena con lo que
+        # escribas en la UI o con AWS_REGION.
+        default_base_url="https://bedrock-runtime.{account_id}.amazonaws.com",
+        key_env="AWS_BEARER_TOKEN_BEDROCK",
+        key_hint="clave de API de Bedrock",
+        console_url="https://console.aws.amazon.com/bedrock/home#/api-keys",
+        account_env="AWS_REGION",
+        account_label="Region",
+        # Punto de partida, no catalogo: los identificadores de Bedrock llevan
+        # version y caducan, el prefijo de region (`us.`) no es universal y
+        # varios de estos modelos solo existen en algunas regiones. Al pulsar
+        # 'Validar' el desplegable se rellena con los perfiles de inferencia y
+        # los modelos bajo demanda que tenga de verdad tu cuenta y tu region.
+        models=[
+            ModelInfo("us.anthropic.claude-sonnet-4-6", "Claude Sonnet 4.6 (US)", "1M",
+                      "razonamiento adaptativo", thinking="adaptive", recommended=True),
+            ModelInfo("us.anthropic.claude-haiku-4-5-20251001-v1:0", "Claude Haiku 4.5 (US)",
+                      "200K", "el mas rapido; su razonamiento usa el dialecto antiguo y no se "
+                      "controla desde aqui"),
+            ModelInfo("us.amazon.nova-2-lite-v1:0", "Amazon Nova 2 Lite (US)", "1M",
+                      "razonamiento apagado por defecto", thinking="toggle"),
+            ModelInfo("openai.gpt-oss-120b-1:0", "gpt-oss 120B", "128K",
+                      "solo en us-east-1, us-east-2 y us-west-2"),
+            ModelInfo("deepseek.v3.2", "DeepSeek V3.2", "164K",
+                      "razona siempre, no se puede apagar; solo en regiones us-*",
+                      thinking="always"),
+            ModelInfo("qwen.qwen3-coder-next", "Qwen3 Coder Next", "256K",
+                      "solo en us-east-1, eu-west-2 y ap-southeast-2"),
         ],
     ),
     "openai_compat": ProviderInfo(

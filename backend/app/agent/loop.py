@@ -344,7 +344,13 @@ class AgentRunner:
         except Exception as exc:  # noqa: BLE001 - el error se reporta, no tumba el servidor
             logger.exception("Fallo en la interaccion %s", self.interaction_id)
             error_text = f"{type(exc).__name__}: {exc}"
-            yield self._event("error", message=error_text)
+            # El codigo HTTP del proveedor viaja aparte del texto: quien
+            # orquesta una bateria decide con el si un fallo es transitorio.
+            yield self._event(
+                "error",
+                message=error_text,
+                status=getattr(exc, "status", None) or getattr(exc, "status_code", None),
+            )
 
         total_ms = (time.perf_counter() - started) * 1000
         metrics = self.metrics.as_mlflow(total_ms)

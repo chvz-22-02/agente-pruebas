@@ -10,7 +10,10 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query, Request
 from sse_starlette.sse import EventSourceResponse
 
+from ..evals.judge import SYSTEM_PROMPT as DEFAULT_JUDGE_PROMPT
 from ..evals.runner import AgentModel, EvalConfigError, EvalRequest, RoleModel, eval_manager
+from ..evals.simulator import DEFAULT_PROMPT as DEFAULT_SIMULATOR_PROMPT
+from ..evals.simulator import PLACEHOLDERS as SIMULATOR_PLACEHOLDERS
 from ..evals.spec import parse_suite
 from ..observability.mlflow_tracker import tracker
 from ..store import repository as repo
@@ -53,10 +56,13 @@ async def _mlflow_links(run: dict) -> dict:
 
 @router.get("/templates")
 async def templates() -> dict:
-    """Plantillas de ejemplo con la estructura de los dos ficheros."""
+    """Plantillas de los dos ficheros y los prompts por defecto de los dos agentes."""
     return {
         "personas_json": (TEMPLATES / "personas.json").read_text(encoding="utf-8"),
         "consultas_json": (TEMPLATES / "consultas.json").read_text(encoding="utf-8"),
+        "simulator_prompt": DEFAULT_SIMULATOR_PROMPT,
+        "simulator_placeholders": list(SIMULATOR_PLACEHOLDERS),
+        "judge_prompt": DEFAULT_JUDGE_PROMPT,
     }
 
 

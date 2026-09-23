@@ -9,6 +9,7 @@ construye el payload, que es donde estan las diferencias que rompen.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -16,6 +17,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.llm.anthropic_provider import AnthropicProvider  # noqa: E402
 from app.llm.base import ToolSpec  # noqa: E402
+from app.llm.bedrock_provider import (  # noqa: E402
+    BedrockProvider,
+    MissingRegion,
+    _error_text,
+)
 from app.llm.catalog import CATALOG, model_info  # noqa: E402
 from app.llm.cloud_openai_providers import (  # noqa: E402
     CloudflareProvider,
@@ -160,7 +166,7 @@ def test_cloud_never_inherits_local_url() -> None:
     """
     from app.llm.registry import default_base_url
 
-    for name in ("anthropic", "openai", "google", "cloudflare", "nvidia"):
+    for name in ("anthropic", "openai", "google", "cloudflare", "nvidia", "aws"):
         url = default_base_url(name)
         assert url.startswith("https://"), f"{name} deberia salir a internet, no a {url}"
         assert "127.0.0.1" not in url and "localhost" not in url
@@ -611,6 +617,269 @@ def test_nvidia_retries_on_rate_limit() -> None:
     print("  nvidia: 429, 500 y 503 del free tier se reintentan respetando Retry-After")
 
 
+AWS_URL_TEMPLATE = "https://bedrock-runtime.{account_id}.amazonaws.com"
+AWS_URL = "https://bedrock-runtime.us-east-1.amazonaws.com"
+AWS_MODEL = "us.anthropic.claude-sonnet-4-6"
+
+
+def _bedrock(handler=None, model: str = AWS_MODEL, url: str = AWS_URL) -> BedrockProvider:
+    import httpx
+
+    provider = BedrockProvider(url, model, api_key="dummy", temperature=0.6, top_p=0.95)
+    if handler is not None:
+        provider._client = httpx.AsyncClient(
+            base_url=provider.base_url,
+            headers=provider._client.headers,
+            transport=httpx.MockTransport(handler),
+        )
+    return provider
+
+
+def test_bedrock_region_resolution() -> None:
+    """La region de la UI manda; si no llega, se usa AWS_REGION."""
+    import os
+
+    previous = os.environ.pop("AWS_REGION", None)
+    try:
+        typed = BedrockProvider(AWS_URL, AWS_MODEL, api_key="dummy")
+        assert typed.has_region and typed.region == "us-east-1", typed.base_url
+
+        os.environ["AWS_REGION"] = "eu-west-1"
+        from_env = BedrockProvider(AWS_URL_TEMPLATE, AWS_MODEL, api_key="dummy")
+        assert from_env.base_url == "https://bedrock-runtime.eu-west-1.amazonaws.com"
+        del os.environ["AWS_REGION"]
+
+        missing = BedrockProvider(AWS_URL_TEMPLATE, AWS_MODEL, api_key="dummy")
+        assert not missing.has_region
+        health = asyncio.run(missing.health())
+        assert not health["ok"] and "region" in health["error"].lower(), health
+        try:
+            asyncio.run(missing.chat([{"role": "user", "content": "hola"}]))
+        except MissingRegion:
+            pass
+        else:
+            raise AssertionError("sin region no deberia llegar a hacer la peticion")
+    finally:
+        if previous is not None:
+            os.environ["AWS_REGION"] = previous
+    print("  aws: region desde la URL o el entorno; sin ella, error claro")
+
+
+def test_bedrock_message_shape() -> None:
+    """Converse: system aparte, toolResult agrupados dentro de un mensaje de usuario."""
+    provider = _bedrock()
+
+    system, rest = provider._split_system(CONVERSATION)
+    assert system == [{"text": "Eres un agente de pruebas."}], system
+    assert all(m["role"] != "system" for m in rest)
+
+    serialized = provider._serialize_messages(rest)
+    assert [m["role"] for m in serialized] == ["user", "assistant", "user"]
+
+    # Los dos resultados van juntos, como en Claude: repartirlos le ensena al
+    # modelo a dejar de pedir herramientas en paralelo.
+    results = serialized[2]["content"]
+    assert len(results) == 2 and all("toolResult" in b for b in results), results
+    assert [b["toolResult"]["toolUseId"] for b in results] == ["call_a", "call_b"]
+    assert results[0]["toolResult"]["content"] == [{"text": '{"stock": 7}'}]
+
+    blocks = serialized[1]["content"]
+    assert blocks[0] == {"text": "Voy a mirarlo."}
+    assert [b["toolUse"]["name"] for b in blocks[1:]] == ["consultar_inventario", "hora_actual"]
+    assert blocks[1]["toolUse"]["input"] == {"sku": "SKU-002"}
+    print("  aws: system aparte, toolResult agrupados y toolUse correctos")
+
+
+def test_bedrock_preserves_reasoning_blocks() -> None:
+    """El razonamiento viene firmado y hay que devolverlo intacto."""
+    provider = _bedrock()
+    original = [
+        {"reasoningContent": {"reasoningText": {"text": "...", "signature": "abc123"}}},
+        {"toolUse": {"toolUseId": "call_a", "name": "x", "input": {}}},
+    ]
+    serialized = provider._serialize_messages(
+        [
+            {"role": "user", "content": "hola"},
+            {"role": "assistant", "content": "", "tool_calls": [], "_provider_blocks": original},
+            {"role": "tool", "content": "ok", "tool_call_id": "call_a", "name": "x"},
+        ]
+    )
+    assert serialized[1]["content"] is original, "se perdieron los bloques firmados"
+    print("  aws: bloques reasoningContent firmados preservados")
+
+
+def test_bedrock_reasoning_by_family() -> None:
+    """Converse no tiene campo comun: cada familia lo deletrea a su manera."""
+    provider = _bedrock()
+
+    assert provider._reasoning(AWS_MODEL, True) == {"thinking": {"type": "adaptive"}}
+    assert provider._reasoning(AWS_MODEL, False) == {"thinking": {"type": "disabled"}}
+    # El prefijo de region no cambia la familia.
+    assert provider._reasoning("anthropic.claude-sonnet-4-6", True) == {"thinking": {"type": "adaptive"}}
+
+    nova = provider._reasoning("us.amazon.nova-2-lite-v1:0", True)
+    assert nova == {"reasoningConfig": {"type": "enabled"}}, nova
+
+    # DeepSeek razona siempre y no lo expone; Qwen y gpt-oss no lo documentan.
+    # Mandar una clave que el esquema del modelo no conoce es un 400 seguro.
+    for model in ("deepseek.v3.2", "qwen.qwen3-coder-next", "openai.gpt-oss-120b-1:0"):
+        assert provider._reasoning(model, True) == {}, model
+
+    # El catalogo puede vetarlo para un modelo concreto (Haiku 4.5 usa el
+    # dialecto antiguo, que los nuevos ya rechazan).
+    assert provider._reasoning("us.anthropic.claude-haiku-4-5-20251001-v1:0", True) == {}
+
+    provider._drop_reasoning = True
+    assert provider._reasoning(AWS_MODEL, True) == {}
+    print("  aws: thinking en Claude, reasoningConfig en Nova, nada en el resto")
+
+
+def test_bedrock_converse_roundtrip() -> None:
+    """Payload de ida y parseo de vuelta contra una respuesta real de Converse."""
+    import httpx
+
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        assert request.headers["authorization"] == "Bearer dummy"
+        return httpx.Response(200, json={
+            "output": {"message": {"role": "assistant", "content": [
+                {"reasoningContent": {"reasoningText": {"text": "lo pienso", "signature": "s1"}}},
+                {"text": "Voy a mirarlo."},
+                {"toolUse": {"toolUseId": "tu_1", "name": "consultar_inventario",
+                             "input": {"sku": "SKU-002"}}},
+            ]}},
+            "stopReason": "tool_use",
+            "usage": {"inputTokens": 120, "outputTokens": 30, "totalTokens": 150},
+        })
+
+    provider = _bedrock(handler)
+    response = asyncio.run(provider.chat(CONVERSATION, TOOLS, thinking=True))
+
+    body = json.loads(seen[0].content)
+    assert seen[0].url.path == f"/model/{AWS_MODEL}/converse", seen[0].url
+    assert body["system"] == [{"text": "Eres un agente de pruebas."}]
+    assert body["inferenceConfig"]["temperature"] == 0.6 and body["inferenceConfig"]["topP"] == 0.95
+    assert body["additionalModelRequestFields"] == {"thinking": {"type": "adaptive"}}
+    # Las herramientas MCP van con el esquema bajo inputSchema.json.
+    tool = body["toolConfig"]["tools"][0]["toolSpec"]
+    assert set(tool) == {"name", "description", "inputSchema"}, tool
+    assert tool["inputSchema"]["json"] == {"type": "object", "properties": {}}
+    assert body["toolConfig"]["toolChoice"] == {"auto": {}}
+
+    assert response.content == "Voy a mirarlo."
+    assert response.thinking == "lo pienso"
+    assert response.finish_reason == "tool_use"
+    assert [c.name for c in response.tool_calls] == ["consultar_inventario"]
+    assert response.tool_calls[0].id == "tu_1"
+    assert response.tool_calls[0].arguments == {"sku": "SKU-002"}
+    assert response.usage.total_tokens == 150 and response.usage.prompt_tokens == 120
+    # Los bloques se conservan para devolverlos firmados en el turno siguiente.
+    assert response.raw_blocks[0]["reasoningContent"]["reasoningText"]["signature"] == "s1"
+    print("  aws: toolConfig de ida, toolUse/reasoningContent de vuelta")
+
+
+def test_bedrock_model_id_is_escaped() -> None:
+    """Los identificadores con version (`...-1:0`) llevan los dos puntos escapados."""
+    import httpx
+
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.raw_path.decode())
+        return httpx.Response(200, json={"output": {"message": {"content": [{"text": "ok"}]}},
+                                         "stopReason": "end_turn", "usage": {}})
+
+    provider = _bedrock(handler, model="openai.gpt-oss-120b-1:0")
+    asyncio.run(provider.chat([{"role": "user", "content": "hola"}]))
+    assert seen[0] == "/model/openai.gpt-oss-120b-1%3A0/converse", seen
+    print("  aws: el identificador del modelo va escapado en la ruta")
+
+
+def test_bedrock_retries_without_rejected_fields() -> None:
+    """Si el modelo rechaza el campo de razonamiento, se retira y se recuerda."""
+    import httpx
+
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        bodies.append(body)
+        if "additionalModelRequestFields" in body:
+            return httpx.Response(400, json={
+                "message": "Malformed input request: #/thinking: subject must not be valid"})
+        return httpx.Response(200, json={"output": {"message": {"content": [{"text": "ok"}]}},
+                                         "stopReason": "end_turn", "usage": {}})
+
+    provider = _bedrock(handler)
+    response = asyncio.run(provider.chat([{"role": "user", "content": "hola"}], thinking=True))
+    assert response.content == "ok" and len(bodies) == 2, bodies
+    assert "additionalModelRequestFields" not in bodies[1]
+
+    # Recordado: la siguiente peticion ya no lo manda ni paga el rechazo.
+    asyncio.run(provider.chat([{"role": "user", "content": "otra"}], thinking=True))
+    assert len(bodies) == 3 and "additionalModelRequestFields" not in bodies[2]
+    print("  aws: el campo de razonamiento rechazado se retira y no vuelve")
+
+
+def test_bedrock_lists_profiles_and_on_demand_models() -> None:
+    """El desplegable necesita las dos listas: el prefijo `us.` no es universal."""
+    import httpx
+
+    seen: list[httpx.URL] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url)
+        if request.url.path == "/inference-profiles":
+            if request.url.params.get("nextToken"):
+                return httpx.Response(200, json={"inferenceProfileSummaries": [
+                    {"inferenceProfileId": "us.amazon.nova-2-lite-v1:0", "status": "ACTIVE"}]})
+            return httpx.Response(200, json={
+                "inferenceProfileSummaries": [
+                    {"inferenceProfileId": "us.anthropic.claude-sonnet-4-6", "status": "ACTIVE"},
+                    {"inferenceProfileId": "us.anthropic.viejo", "status": "INACTIVE"},
+                ],
+                "nextToken": "pagina2",
+            })
+        return httpx.Response(200, json={"modelSummaries": [
+            {"modelId": "deepseek.v3.2", "modelLifecycle": {"status": "ACTIVE"}},
+            {"modelId": "amazon.titan-retirado", "modelLifecycle": {"status": "LEGACY"}},
+        ]})
+
+    provider = _bedrock(handler)
+    models = asyncio.run(provider.list_models())
+    assert models == [
+        "deepseek.v3.2", "us.amazon.nova-2-lite-v1:0", "us.anthropic.claude-sonnet-4-6",
+    ], models
+
+    # El listado vive en el plano de control, otro host que la inferencia.
+    assert all(u.host == "bedrock.us-east-1.amazonaws.com" for u in seen), seen
+    assert seen[0].params["type"] == "SYSTEM_DEFINED"
+    assert seen[-1].params["byOutputModality"] == "TEXT"
+    print("  aws: perfiles paginados + modelos bajo demanda, sin los retirados")
+
+
+def test_bedrock_errors_are_actionable() -> None:
+    import httpx
+
+    provider = _bedrock()
+    profile = provider._explain_error(
+        400, "Invocation of model ID anthropic.claude-haiku-4-5 with on-demand throughput isn't supported"
+    )
+    assert "perfil de inferencia" in profile, profile
+    assert "formulario de acceso" in provider._explain_error(403, "AccessDeniedException")
+    assert "bedrock:ListInferenceProfiles" in provider._explain_listing_error(403, "denied")
+
+    # El cuerpo de error de AWS es {"message": ...} y el tipo va en cabecera.
+    response = httpx.Response(
+        400, headers={"x-amzn-errortype": "ValidationException:http://internal"},
+        json={"message": "Malformed input request"},
+    )
+    assert _error_text(response) == "ValidationException: Malformed input request"
+    print("  aws: perfiles de inferencia, permisos de listado y errores de AWS traducidos")
+
+
 def test_catalog_consistency() -> None:
     for name, info in CATALOG.items():
         assert info.name == name
@@ -647,6 +916,15 @@ if __name__ == "__main__":
         test_nvidia_thinking_via_template_kwargs,
         test_nvidia_model_filter,
         test_nvidia_retries_on_rate_limit,
+        test_bedrock_region_resolution,
+        test_bedrock_message_shape,
+        test_bedrock_preserves_reasoning_blocks,
+        test_bedrock_reasoning_by_family,
+        test_bedrock_converse_roundtrip,
+        test_bedrock_model_id_is_escaped,
+        test_bedrock_retries_without_rejected_fields,
+        test_bedrock_lists_profiles_and_on_demand_models,
+        test_bedrock_errors_are_actionable,
         test_catalog_consistency,
     ]:
         print(f"{test.__name__}:")

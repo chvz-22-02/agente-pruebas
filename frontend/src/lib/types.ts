@@ -218,8 +218,10 @@ export type ProviderInfo = {
   key_env: string;
   key_hint: string;
   console_url: string;
-  /** Variable con el identificador de cuenta si la URL lo lleva (Cloudflare). */
+  /** Variable con el dato que va dentro de la URL (Cloudflare: cuenta, AWS: region). */
   account_env: string;
+  /** Como se llama ese dato en la UI ("Account ID", "Region"). */
+  account_label: string;
   supports_pull: boolean;
   models: CatalogModel[];
 };
@@ -253,9 +255,20 @@ export type RoleConfig = {
   model: string;
   temperature: number;
   thinking: boolean;
+  /** Vacio = el prompt por defecto del papel. */
+  system_prompt: string;
 };
 
-export type EvalStatus = "pending" | "running" | "passed" | "failed" | "error" | "cancelled" | "interrupted";
+export type EvalStatus =
+  | "pending"
+  | "running"
+  | "passed"
+  | "failed"
+  /** Juzgado con un prompt propio del evaluador: hay respuesta, no hay nota. */
+  | "evaluated"
+  | "error"
+  | "cancelled"
+  | "interrupted";
 
 /** Un criterio evaluado (del evaluador LLM o una comprobacion determinista). */
 export type EvalItem = {
@@ -314,6 +327,8 @@ export type EvalResultView = {
   resumen?: string;
   items?: EvalItem[];
   failed_mandatory?: string[];
+  /** El evaluador uso un prompt propio: `resumen` es su respuesta tal cual. */
+  custom_judge?: boolean;
   transcript: EvalTurn[];
   metrics?: Record<string, number>;
   mlflow_run_id?: string;

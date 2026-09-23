@@ -55,19 +55,22 @@ AMBIGUITY = {
 }
 
 
-def build_system_prompt(persona: Persona, case: Case) -> str:
-    return f"""Eres un simulador de usuarios. Interpretas a una PERSONA real que conversa por \
+# Marcadores que se rellenan con la persona y la consulta. Un prompt propio
+# escrito desde la UI usa los mismos; los que no ponga, no se rellenan.
+PLACEHOLDERS = ("{persona_nombre}", "{persona_descripcion}", "{goal}", "{ambiguedad}", "{fin}")
+
+DEFAULT_PROMPT = """Eres un simulador de usuarios. Interpretas a una PERSONA real que conversa por \
 chat con un asistente de IA para conseguir un OBJETIVO. Tu no eres el asistente: eres el usuario.
 
 ## Tu personaje
-Nombre: {persona.nombre}
-{persona.descripcion.strip() or "(sin descripcion)"}
+Nombre: {persona_nombre}
+{persona_descripcion}
 
 ## Tu objetivo en esta conversacion
-{case.goal.strip()}
+{goal}
 
 ## Como preguntas
-{AMBIGUITY.get(case.ambiguedad, "Preguntas con naturalidad, como lo haria tu personaje.")}
+{ambiguedad}
 
 ## Reglas
 - Escribe SOLO tu siguiente mensaje, en primera persona. Sin comillas, sin prefijos como \
@@ -79,9 +82,30 @@ Nombre: {persona.nombre}
 - Si el asistente te pide una aclaracion, respondela de forma coherente con tu personaje y \
 con la informacion que conoces.
 - Cuando tu objetivo este cumplido, cuando el asistente deje claro que no puede cumplirlo o \
-cuando la conversacion no avance, despidete en una frase y termina el mensaje con {FIN}. \
-Si no tienes nada mas que decir, responde unicamente {FIN}.
-- Si tu mensaje hace una pregunta o pide algo, NO pongas {FIN}: espera la respuesta."""
+cuando la conversacion no avance, despidete en una frase y termina el mensaje con {fin}. \
+Si no tienes nada mas que decir, responde unicamente {fin}.
+- Si tu mensaje hace una pregunta o pide algo, NO pongas {fin}: espera la respuesta."""
+
+
+def build_system_prompt(persona: Persona, case: Case, template: str | None = None) -> str:
+    """Rellena la plantilla (la propia o la de la UI) con la persona y la consulta.
+
+    Se sustituye marcador a marcador en vez de usar `str.format`: un prompt
+    escrito a mano puede llevar llaves sueltas y no debe reventar por eso.
+    """
+    values = {
+        "{persona_nombre}": persona.nombre,
+        "{persona_descripcion}": persona.descripcion.strip() or "(sin descripcion)",
+        "{goal}": case.goal.strip(),
+        "{ambiguedad}": AMBIGUITY.get(
+            case.ambiguedad, "Preguntas con naturalidad, como lo haria tu personaje."
+        ),
+        "{fin}": FIN,
+    }
+    text = template if template and template.strip() else DEFAULT_PROMPT
+    for marker, value in values.items():
+        text = text.replace(marker, value)
+    return text
 
 
 def render_dialogue(dialogue: list[tuple[str, str]]) -> str:
@@ -165,6 +189,7 @@ class UserSimulator:
         temperature: float | None = None,
         thinking: bool | None = None,
         max_tokens: int | None = None,
+        system_prompt: str | None = None,
     ) -> None:
         self.provider = provider
         self.persona = persona
@@ -172,7 +197,7 @@ class UserSimulator:
         self.temperature = temperature
         self.thinking = thinking
         self.max_tokens = max_tokens
-        self.system_prompt = build_system_prompt(persona, case)
+        self.system_prompt = build_system_prompt(persona, case, system_prompt)
 
     async def next_message(
         self, dialogue: list[tuple[str, str]], turn: int = 1, max_turns: int = 6

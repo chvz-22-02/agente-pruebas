@@ -167,25 +167,29 @@ class MCPConnection:
 
     async def _run(self) -> None:
         errors: list[str] = []
-        for kind in self._transport_order():
-            try:
-                await self._serve(kind)
-                return
-            except asyncio.CancelledError:
-                raise
-            except BaseException as exc:  # noqa: BLE001 - anyio agrupa en ExceptionGroup
-                detail = f"{kind}: {_flatten(exc)}"
-                errors.append(detail)
-                logger.warning("Conexion MCP fallida (%s)", detail)
-                if self._ready is not None and self._ready.done():
-                    # Ya habia conectado: la caida es posterior, no probamos otro transporte.
-                    self.last_error = detail
+        try:
+            for kind in self._transport_order():
+                try:
+                    await self._serve(kind)
                     return
-        self.last_error = " | ".join(errors)
-        if self._ready is not None and not self._ready.done():
-            self._ready.set_exception(
-                MCPConnectionError(f"No se pudo conectar a {self.config.url} -> {self.last_error}")
-            )
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as exc:  # noqa: BLE001 - anyio agrupa en ExceptionGroup
+                    detail = f"{kind}: {_flatten(exc)}"
+                    errors.append(detail)
+                    logger.warning("Conexion MCP fallida (%s)", detail)
+                    if self._ready is not None and self._ready.done():
+                        # Ya habia conectado: la caida es posterior, no probamos otro transporte.
+                        self.last_error = detail
+                        return
+            self.last_error = " | ".join(errors)
+            if self._ready is not None and not self._ready.done():
+                self._ready.set_exception(
+                    MCPConnectionError(f"No se pudo conectar a {self.config.url} -> {self.last_error}")
+                )
+        finally:
+            # Salga como salga, esta conexion ya no atiende a nadie.
+            self._fail_pending()
 
     async def _serve(self, kind: str) -> None:
         from mcp import Implementation
@@ -234,6 +238,29 @@ class MCPConnection:
             for t in result.tools
         ]
 
+    def _died(self, op: str = "") -> MCPConnectionError:
+        doing = f" mientras se ejecutaba '{op}'" if op else ""
+        return MCPConnectionError(
+            f"La conexion con {self.config.url} se cerro{doing}. {self.last_error or ''}".strip()
+        )
+
+    def _fail_pending(self) -> None:
+        """Nadie va a atender lo que quede en la cola: mejor fallar que esperar.
+
+        Sin esto, quien ya habia encolado su comando cuando murio la conexion
+        se queda esperando el timeout completo para nada.
+        """
+        while True:
+            try:
+                command = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            if command is None:
+                continue
+            _, _, future = command
+            if not future.done():
+                future.set_exception(self._died())
+
     async def _command_loop(self, client: Any) -> None:
         while True:
             command = await self._queue.get()
@@ -247,8 +274,14 @@ class MCPConnection:
                 if not future.done():
                     future.set_result(result)
             except asyncio.CancelledError:
+                # La conexion se cae bajo los pies de quien espera. Cancelarle
+                # el future le llega como CancelledError, que es BaseException:
+                # se cuela por los `except Exception` del bucle del agente
+                # -dejando la traza a medias y las metricas sin escribir- y mas
+                # arriba la bateria de evaluacion lo confunde con un "el usuario
+                # pulso detener". Es un fallo de la conexion y como tal viaja.
                 if not future.done():
-                    future.cancel()
+                    future.set_exception(self._died(op))
                 raise
             except Exception as exc:  # noqa: BLE001
                 if not future.done():

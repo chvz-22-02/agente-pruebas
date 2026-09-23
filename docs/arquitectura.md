@@ -183,9 +183,10 @@ omitirlo no desactiva el razonamiento, porque modelos como Qwen3 razonan por def
 interruptor solo funcionaría en un sentido.
 
 **Los campos que el proveedor exige de vuelta viajan con la llamada.** Claude pide sus
-bloques de razonamiento firmados y Gemini 3 su `thought_signature` por cada `functionCall`.
-Claude lo resuelve con `raw_blocks`, que solo vive en memoria porque a él le basta con el
-turno en curso; Gemini lo necesita también en turnos posteriores, así que su firma se guarda
+bloques de razonamiento firmados, Bedrock lo mismo con `reasoningContent` (texto **y** firma,
+sin modificar) y Gemini 3 su `thought_signature` por cada `functionCall`.
+Claude y Bedrock lo resuelven con `raw_blocks`, que solo vive en memoria porque les basta con
+el turno en curso; Gemini lo necesita también en turnos posteriores, así que su firma se guarda
 en `ToolCall.extra` y se serializa dentro de `tool_calls` — es decir, se persiste en SQLite y
 sobrevive a reconstruir el historial. El reenvío está atado a `extra_content_key`, para que
 un `extra_content` de Gemini no acabe en una petición a OpenAI si se cambia de modelo a mitad

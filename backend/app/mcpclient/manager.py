@@ -78,6 +78,35 @@ class MCPManager:
         await conn.stop()
         return True
 
+    async def reconnect(self, conn_id: str) -> dict[str, Any]:
+        """Levanta de nuevo una conexion caida **con el mismo identificador**.
+
+        Una bateria de evaluacion, las conversaciones guardadas y la UI
+        referencian la conexion por `conn_id`; si al reconectar cambiara, todo
+        eso quedaria apuntando a una conexion muerta. Primero se cierra la
+        vieja del todo -aunque su sesion siguiera medio abierta- y despues se
+        abre otra con la misma configuracion y se registra bajo el mismo id.
+        """
+        async with self._lock:
+            old = self._connections.pop(conn_id, None)
+        if old is None:
+            raise MCPConnectionError(f"Conexion MCP no encontrada: {conn_id}")
+        await old.stop()
+
+        conn = MCPConnection(old.config, on_frame=self._broadcast)
+        conn.conn_id = conn_id
+        description = await conn.start()
+        async with self._lock:
+            self._connections[conn_id] = conn
+        logger.info(
+            "MCP reconectado: %s (%s) via %s con %d herramientas",
+            old.config.url,
+            conn.server_info.get("name"),
+            conn.active_transport,
+            len(conn.tools),
+        )
+        return description
+
     async def disconnect_all(self) -> None:
         async with self._lock:
             conns = list(self._connections.values())
@@ -159,7 +188,19 @@ class ToolRouter:
                 error=f"La herramienta '{exposed_name}' no existe. Disponibles: {available}",
             )
         conn_id, real_name = target
-        result = await self.manager.get(conn_id).call_tool(real_name, arguments)
+        try:
+            result = await self.manager.get(conn_id).call_tool(real_name, arguments)
+        except MCPConnectionError as exc:
+            # El servidor se cayo a mitad del turno. Se le devuelve al modelo
+            # como observacion, igual que cualquier otro error de herramienta:
+            # el turno termina y se puede evaluar, en vez de reventar el bucle.
+            return MCPToolResult(
+                tool_name=exposed_name,
+                arguments=arguments,
+                ok=False,
+                text="",
+                error=str(exc),
+            )
         result.tool_name = exposed_name
         return result
 

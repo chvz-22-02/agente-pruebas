@@ -9,7 +9,7 @@ import type { EvalEvent, EvalResultView, EvalStatus, EvalTurn } from "./types";
  * (`EvalResultView`) para que la vista no tenga que distinguirlas.
  */
 
-export const FINISHED: EvalStatus[] = ["passed", "failed", "error", "cancelled", "interrupted"];
+export const FINISHED: EvalStatus[] = ["passed", "failed", "evaluated", "error", "cancelled", "interrupted"];
 
 /** Resultado tal y como lo devuelve GET /api/eval/runs/{id}. */
 export function fromPersisted(row: any): EvalResultView {
@@ -50,6 +50,7 @@ export function fromPersisted(row: any): EvalResultView {
     resumen: row.verdict?.resumen || "",
     items: row.items || [],
     failed_mandatory: row.verdict?.aggregate?.failed_mandatory || [],
+    custom_judge: !!row.verdict?.custom_prompt,
     transcript,
     metrics: row.metrics || {},
     mlflow_run_id: row.mlflow_run_id || "",
@@ -163,6 +164,7 @@ export function applyEvent(results: EvalResultView[], event: EvalEvent): EvalRes
       next.resumen = event.resumen || "";
       next.error = event.error || "";
       next.failed_mandatory = event.failed_mandatory || [];
+      next.custom_judge = !!event.custom_judge;
       next.metrics = event.metrics || {};
       next.mlflow_run_id = event.mlflow_run_id || "";
       break;
@@ -232,6 +234,7 @@ export const STATUS_LABEL: Record<string, string> = {
   running: "en curso",
   passed: "aprobado",
   failed: "suspendido",
+  evaluated: "evaluado",
   error: "error",
   cancelled: "cancelado",
   interrupted: "interrumpido",
@@ -242,6 +245,7 @@ export const PHASE_LABEL: Record<string, string> = {
   simulando: "la persona escribe",
   agente: "el agente responde",
   evaluando: "evaluando",
+  esperando: "endpoint saturado: se repite en 10 min",
 };
 
 export const END_REASON_LABEL: Record<string, string> = {

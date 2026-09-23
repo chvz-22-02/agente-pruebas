@@ -129,6 +129,14 @@ Devuelve ahora el JSON de evaluacion."""
 
 
 class Judge:
+    """Con el prompt por defecto exige el JSON de la rubrica; con uno propio, no.
+
+    Un prompt escrito desde la UI puede pedir cualquier cosa (un informe, una
+    nota del 1 al 10, un parrafo), asi que no se le impone el contrato JSON ni
+    se le reprocha no cumplirlo: se guarda su respuesta tal cual y la nota
+    por rubrica queda desactivada.
+    """
+
     def __init__(
         self,
         provider: LLMProvider,
@@ -136,11 +144,14 @@ class Judge:
         temperature: float | None = 0.0,
         thinking: bool | None = None,
         max_tokens: int | None = None,
+        system_prompt: str | None = None,
     ) -> None:
         self.provider = provider
         self.temperature = temperature
         self.thinking = thinking
         self.max_tokens = max_tokens
+        self.custom = bool(system_prompt and system_prompt.strip())
+        self.system_prompt = system_prompt.strip() if self.custom else SYSTEM_PROMPT  # type: ignore[union-attr]
 
     async def evaluate(
         self,
@@ -150,14 +161,15 @@ class Judge:
         checks: list[dict[str, Any]],
     ) -> JudgeOutcome:
         messages: list[dict[str, str]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": build_user_prompt(case, persona, transcript, checks)},
         ]
         outcome = JudgeOutcome(verdict=None, messages=list(messages))
 
         # Un segundo intento con una peticion de reparacion: los modelos
         # locales a veces anaden prosa alrededor del JSON o lo dejan a medias.
-        for attempt in (1, 2):
+        # Con un prompt propio no hay contrato que reparar: un solo intento.
+        for attempt in (1,) if self.custom else (1, 2):
             outcome.attempts = attempt
             response = await self.provider.chat(
                 messages,
@@ -171,7 +183,7 @@ class Judge:
             outcome.raw = response.content
             outcome.thinking = response.thinking
             verdict = extract_json(response.content)
-            if verdict is not None:
+            if verdict is not None or self.custom:
                 outcome.verdict = verdict
                 return outcome
             messages = [

@@ -1,9 +1,11 @@
 /**
- * Proveedores cuya URL lleva el identificador de cuenta dentro (Cloudflare:
- * `/client/v4/accounts/{account_id}/ai/v1`). La UI oculta la URL en los
- * proveedores de nube, asi que el Account ID se pide aparte y se inserta aqui.
- * Si se deja vacio, el marcador viaja tal cual y el backend lo rellena con la
- * variable de entorno del catalogo (CLOUDFLARE_ACCOUNT_ID).
+ * Proveedores cuya URL lleva un dato dentro: la cuenta en Cloudflare
+ * (`/client/v4/accounts/{account_id}/ai/v1`) y la region en AWS
+ * (`bedrock-runtime.{account_id}.amazonaws.com`). La UI oculta la URL en los
+ * proveedores de nube, asi que ese dato se pide aparte y se inserta aqui; el
+ * catalogo dice como se llama (`account_label`). Si se deja vacio, el marcador
+ * viaja tal cual y lo rellena el backend con la variable de entorno del
+ * catalogo (CLOUDFLARE_ACCOUNT_ID, AWS_REGION).
  */
 export const ACCOUNT_PLACEHOLDER = "{account_id}";
 
