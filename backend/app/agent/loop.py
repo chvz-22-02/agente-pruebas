@@ -39,6 +39,8 @@ MAX_TOOL_RESULT_CHARS = 12000
 # Recorte del texto que viaja a la UI por SSE. La UI muestra un extracto; el
 # contenido integro se recupera de SQLite (/api/traces) y de MLflow.
 MAX_UI_RESULT_CHARS = 4000
+# Nombre del argumento con el que viaja el token de la sesion.
+SESSION_TOKEN_ARG = "session_token"
 
 
 @dataclass
@@ -59,6 +61,9 @@ class RunConfig:
     thinking: bool | None = None
     system_prompt: str = ""
     max_iterations: int | None = None
+    # Si es True, el token de la sesion viaja como argumento `session_token` en
+    # todas las llamadas a herramientas. Lo pone el agente, no el modelo.
+    send_session_token: bool = False
     # Experimento de MLflow donde registrar. Vacio => el de la sesion o el del
     # backend. Se resuelve en `run()` a partir de la sesion.
     mlflow_experiment: str = ""
@@ -169,8 +174,12 @@ class AgentRunner:
             or ""
         )
 
+        injected: dict[str, Any] = {}
+        if self.cfg.send_session_token:
+            injected[SESSION_TOKEN_ARG] = await repo.get_session_token(self.cfg.session_id)
+
         alive_ids = mcp_manager.alive_ids(self.cfg.mcp_conn_ids)
-        router = ToolRouter(mcp_manager, alive_ids)
+        router = ToolRouter(mcp_manager, alive_ids, injected=injected)
         servers = [mcp_manager.get(cid).describe() for cid in alive_ids]
         server_summary = [
             {
@@ -226,6 +235,7 @@ class AgentRunner:
                 "thinking": self.cfg.thinking if self.cfg.thinking is not None else settings.llm_thinking,
                 "max_iterations": self.cfg.max_iterations or settings.agent_max_iterations,
                 "mcp_urls": ", ".join(s["url"] for s in server_summary) or "(ninguno)",
+                "send_session_token": self.cfg.send_session_token,
             },
         )
         if self.trace.run_id:
@@ -488,6 +498,10 @@ class AgentRunner:
     ) -> AsyncIterator[dict[str, Any]]:
         self.tool_seq += 1
         origin = router.server_of(call.name)
+        # Lo que viaja de verdad al MCP: lo del modelo mas los argumentos fijos
+        # del agente. El historial del LLM conserva solo lo que el genero.
+        arguments = router.with_injected(call.arguments)
+        injected = sorted(router.injected)
 
         yield self._event(
             "tool_call",
@@ -495,7 +509,8 @@ class AgentRunner:
             seq=self.tool_seq,
             iteration=iteration,
             tool=call.name,
-            arguments=call.arguments,
+            arguments=arguments,
+            injected=injected,
             server=origin,
         )
 
@@ -503,7 +518,7 @@ class AgentRunner:
             self.trace,  # type: ignore[arg-type]
             name=f"mcp_tool::{call.name}",
             span_type="TOOL",
-            inputs={"tool": call.name, "arguments": call.arguments},
+            inputs={"tool": call.name, "arguments": arguments},
             attributes={
                 "iteration": iteration,
                 "seq": self.tool_seq,
@@ -511,6 +526,7 @@ class AgentRunner:
                 "mcp_server_url": origin.get("url", ""),
                 "mcp_conn_id": origin.get("conn_id", ""),
                 "mcp_real_tool": origin.get("real_tool", call.name),
+                "injected_args": injected,
             },
         )
 
@@ -548,7 +564,8 @@ class AgentRunner:
                     "tool": call.name,
                     "real_tool": origin.get("real_tool", call.name),
                     "server": origin,
-                    "arguments": call.arguments,
+                    "arguments": arguments,
+                    "injected_args": injected,
                     "ok": result.ok,
                     "error": result.error,
                     "latency_ms": result.latency_ms,
@@ -592,7 +609,7 @@ class AgentRunner:
             server_name=origin.get("server_name", ""),
             server_url=origin.get("url", ""),
             conn_id=origin.get("conn_id", ""),
-            arguments=call.arguments,
+            arguments=arguments,
             result_text=result.text,
             structured=result.structured,
             ok=result.ok,
@@ -612,7 +629,7 @@ class AgentRunner:
                     "tool": call.name,
                     "server": origin.get("server_name", ""),
                     "url": origin.get("url", ""),
-                    "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                    "arguments": json.dumps(arguments, ensure_ascii=False),
                     "ok": result.ok,
                     "latency_ms": round(result.latency_ms, 2),
                     "error": result.error or "",
@@ -631,7 +648,8 @@ class AgentRunner:
                 "seq": self.tool_seq,
                 "tool": call.name,
                 "server": origin,
-                "arguments": call.arguments,
+                "arguments": arguments,
+                "injected_args": injected,
                 "ok": result.ok,
                 # Integro: este transcript acaba en el artifact de la interaccion.
                 "result": result.text,

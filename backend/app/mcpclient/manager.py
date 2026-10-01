@@ -26,6 +26,26 @@ def _slug(value: str) -> str:
     return SAFE_NAME.sub("_", value.strip())[:32] or "mcp"
 
 
+def _hide_params(schema: dict[str, Any], names: set[str]) -> dict[str, Any]:
+    """Quita del esquema los parametros que pone el agente, no el modelo.
+
+    Si el modelo los viera, intentaria rellenarlos (o se inventaria un valor
+    para uno obligatorio). Se devuelve una copia: el esquema original de la
+    conexion se sigue mostrando tal cual en la UI.
+    """
+    if not names or not isinstance(schema, dict):
+        return schema
+    properties = schema.get("properties")
+    required = schema.get("required")
+    if not isinstance(properties, dict) or not names & set(properties):
+        return schema
+    hidden = dict(schema)
+    hidden["properties"] = {k: v for k, v in properties.items() if k not in names}
+    if isinstance(required, list):
+        hidden["required"] = [r for r in required if r not in names]
+    return hidden
+
+
 class MCPManager:
     """Registro global de conexiones MCP vivas."""
 
@@ -136,11 +156,22 @@ class MCPManager:
 
 
 class ToolRouter:
-    """Vista de herramientas que se le entrega al LLM en una interaccion."""
+    """Vista de herramientas que se le entrega al LLM en una interaccion.
 
-    def __init__(self, manager: MCPManager, conn_ids: list[str]) -> None:
+    `injected` son argumentos fijos que el agente anade a *todas* las llamadas
+    (p.ej. `session_token`). No dependen del modelo: se ocultan del esquema
+    que ve y, si aun asi los manda, se sobrescriben con el valor fijo.
+    """
+
+    def __init__(
+        self,
+        manager: MCPManager,
+        conn_ids: list[str],
+        injected: dict[str, Any] | None = None,
+    ) -> None:
         self.manager = manager
         self.conn_ids = conn_ids
+        self.injected = dict(injected or {})
         self._map: dict[str, tuple[str, str]] = {}  # nombre expuesto -> (conn_id, nombre real)
         self._specs: list[ToolSpec] = []
         self._build()
@@ -161,7 +192,7 @@ class ToolRouter:
                     ToolSpec(
                         name=exposed,
                         description=tool.description,
-                        input_schema=tool.input_schema,
+                        input_schema=_hide_params(tool.input_schema, set(self.injected)),
                     )
                 )
 
@@ -176,7 +207,12 @@ class ToolRouter:
     def catalog(self) -> list[dict[str, Any]]:
         return [{"name": s.name, "description": s.description} for s in self._specs]
 
+    def with_injected(self, arguments: dict[str, Any] | None) -> dict[str, Any]:
+        """Argumentos que viajan de verdad al MCP: los fijos mandan sobre el modelo."""
+        return {**(arguments or {}), **self.injected}
+
     async def call(self, exposed_name: str, arguments: dict[str, Any]) -> MCPToolResult:
+        arguments = self.with_injected(arguments)
         target = self._map.get(exposed_name)
         if target is None:
             available = ", ".join(sorted(self._map)) or "(ninguna)"

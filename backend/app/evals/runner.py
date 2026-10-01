@@ -117,6 +117,8 @@ class EvalRequest:
     simulator: RoleModel
     judge: RoleModel
     mcp_conn_ids: list[str] = field(default_factory=list)
+    # Inyecta el token de la sesion de la evaluacion como `session_token`.
+    send_session_token: bool = False
     name: str = ""
     # Como se llama el banco de pruebas; agrupa ejecuciones en MLflow.
     suite: str = ""
@@ -698,6 +700,7 @@ class EvalJob:
                 thinking=req.agent.thinking,
                 system_prompt=req.agent.system_prompt,
                 max_iterations=req.agent.max_iterations,
+                send_session_token=req.send_session_token,
                 mlflow_experiment=self.experiment,
                 trace_tags={**eval_tags, "eval_role": "agent", "eval_turn": str(turn)},
                 run_tags=eval_tags,
@@ -1153,6 +1156,7 @@ class EvalManager:
             "judge": request.judge.resolved(),
             "mcp_conn_ids": request.mcp_conn_ids,
             "mcp_urls": [mcp_manager.get(c).config.url for c in mcp_manager.alive_ids(request.mcp_conn_ids)],
+            "send_session_token": request.send_session_token,
             "case_ids": request.case_ids,
             "persona_ids": request.persona_ids,
             "repetitions": request.repetitions,

@@ -76,6 +76,7 @@ async def chat(payload: ChatRequest, request: Request) -> EventSourceResponse:
             thinking=payload.thinking,
             system_prompt=payload.system_prompt,
             max_iterations=payload.max_iterations,
+            send_session_token=payload.send_session_token,
             mlflow_experiment=experiment,
         )
     )

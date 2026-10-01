@@ -405,6 +405,19 @@ Matiz de MLflow: las trazas se eliminan de verdad; los runs se marcan como elimi
 (`delete_run` es un borrado lógico y desaparecen de la vista normal). MLflow no ofrece
 borrado físico por API — para liberar el disco, `mlflow gc` en el servidor de tracking.
 
+### Token de sesión (`session_token`)
+
+Cada sesión nace con un token aleatorio propio (columna `sessions.session_token`). El botón
+**session_token: ON/OFF** de la cabecera del chat hace que el agente lo añada como argumento
+`session_token` a **todas** las llamadas a herramientas. El tooltip del botón muestra el
+token de la sesión abierta.
+
+No depende del modelo: el parámetro se quita del esquema de herramientas que ve el LLM (para
+que no intente rellenarlo) y se añade después de que el modelo genere sus argumentos; si
+aun así manda uno, se sobrescribe. El historial del LLM guarda solo lo que el modelo generó;
+la UI, SQLite y MLflow registran los argumentos que viajaron de verdad al MCP, marcando cuáles
+puso el agente. La evaluación usa el mismo ajuste, con el token de su propia sesión.
+
 ---
 
 ## 4. Frontend y backend en máquinas distintas

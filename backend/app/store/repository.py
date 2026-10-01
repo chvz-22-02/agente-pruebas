@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 import time
 from typing import Any
 
@@ -18,6 +19,11 @@ def default_session_title() -> str:
     return time.strftime("%d/%m %H:%M")
 
 
+def new_session_token() -> str:
+    """Token aleatorio que identifica la sesion ante el servidor MCP."""
+    return secrets.token_urlsafe(32)
+
+
 # --------------------------------------------------------------- sesiones ---
 async def create_session(
     title: str = "", metadata: dict | None = None, mlflow_experiment: str = ""
@@ -25,9 +31,18 @@ async def create_session(
     session_id = new_id("ses")
     ts = now()
     await db.execute(
-        """INSERT INTO sessions (id, title, created_at, updated_at, metadata, mlflow_experiment)
-           VALUES (?,?,?,?,?,?)""",
-        (session_id, title or default_session_title(), ts, ts, dumps(metadata or {}), mlflow_experiment),
+        """INSERT INTO sessions
+               (id, title, created_at, updated_at, metadata, mlflow_experiment, session_token)
+           VALUES (?,?,?,?,?,?,?)""",
+        (
+            session_id,
+            title or default_session_title(),
+            ts,
+            ts,
+            dumps(metadata or {}),
+            mlflow_experiment,
+            new_session_token(),
+        ),
     )
     return await get_session(session_id)  # type: ignore[return-value]
 
@@ -53,12 +68,38 @@ async def ensure_session(
     if session_id:
         ts = now()
         await db.execute(
-            """INSERT INTO sessions (id, title, created_at, updated_at, metadata, mlflow_experiment)
-               VALUES (?,?,?,?,?,?)""",
-            (session_id, title or default_session_title(), ts, ts, "{}", mlflow_experiment),
+            """INSERT INTO sessions
+                   (id, title, created_at, updated_at, metadata, mlflow_experiment, session_token)
+               VALUES (?,?,?,?,?,?,?)""",
+            (
+                session_id,
+                title or default_session_title(),
+                ts,
+                ts,
+                "{}",
+                mlflow_experiment,
+                new_session_token(),
+            ),
         )
         return session_id
     return (await create_session(title, mlflow_experiment=mlflow_experiment))["id"]
+
+
+async def get_session_token(session_id: str) -> str:
+    """Token de la sesion; se genera aqui si la sesion es anterior a la columna."""
+    session = await get_session(session_id)
+    if session is None:
+        return ""
+    token = session.get("session_token") or ""
+    if not token:
+        token = new_session_token()
+        await db.execute(
+            "UPDATE sessions SET session_token = ? WHERE id = ? AND session_token = ''",
+            (token, session_id),
+        )
+        # Si otra peticion lo genero a la vez, manda el que quedo guardado.
+        token = (await get_session(session_id) or {}).get("session_token") or token
+    return token
 
 
 async def update_session(session_id: str, **fields: Any) -> None:

@@ -94,6 +94,8 @@ export type ChatPayload = {
   mlflow_experiment?: string;
   /** Clave del proveedor de nube; el backend no la persiste. */
   api_key?: string | null;
+  /** Anade el token de la sesion como `session_token` a cada llamada a herramienta. */
+  send_session_token?: boolean;
 };
 
 /**

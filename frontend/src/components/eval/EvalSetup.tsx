@@ -11,6 +11,8 @@ export type AgentSettings = {
   thinking: boolean;
   maxIterations: number;
   systemPrompt: string;
+  /** Inyectar el token de la sesion como `session_token` en cada herramienta. */
+  sendSessionToken: boolean;
 };
 
 type Props = {
@@ -432,6 +434,8 @@ export default function EvalSetup({
       simulator: rolePayload(simulator, prompts.simulator),
       judge: rolePayload(judge, prompts.judge),
       mcp_conn_ids: mcp.connIds,
+      // Cada evaluacion tiene su propia sesion y, por tanto, su propio token.
+      send_session_token: agent.sendSessionToken,
       // Vacio = todos; se manda la lista solo si hay descartes.
       case_ids: excludedCases.length ? includedCases.map((c) => c.id) : [],
       persona_ids: excludedPersonas.length ? includedPersonas.map((p) => p.id) : [],
@@ -619,6 +623,12 @@ export default function EvalSetup({
           <div className="muted">
             {agent.provider} / <code>{agent.model || "-"}</code> · temp. {agent.temperature} ·{" "}
             {agent.thinking ? "con" : "sin"} razonamiento · {agent.maxIterations} iter.
+            {agent.sendSessionToken && (
+              <>
+                {" "}
+                · <code>session_token</code> inyectado
+              </>
+            )}
           </div>
           <div className="muted" style={{ color: mcp.servers ? undefined : "var(--warn)" }}>
             {mcp.servers
