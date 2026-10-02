@@ -358,6 +358,12 @@ class EvalJob:
             mcp_urls=mcp_urls,
             items=[self._item_ref(i, item) for i, item in enumerate(self.items)],
         )
+        if req.send_session_token:
+            self.emit(
+                "log",
+                level="info",
+                message="Se inyecta el session_token de la sesion de esta evaluacion en cada llamada a herramienta.",
+            )
         if not alive:
             self.emit(
                 "log",

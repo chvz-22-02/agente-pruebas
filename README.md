@@ -416,7 +416,11 @@ No depende del modelo: el parámetro se quita del esquema de herramientas que ve
 que no intente rellenarlo) y se añade después de que el modelo genere sus argumentos; si
 aun así manda uno, se sobrescribe. El historial del LLM guarda solo lo que el modelo generó;
 la UI, SQLite y MLflow registran los argumentos que viajaron de verdad al MCP, marcando cuáles
-puso el agente. La evaluación usa el mismo ajuste, con el token de su propia sesión.
+puso el agente.
+
+En modo **Evaluación** el mismo botón aparece en *3 · Modelos → Agente bajo prueba* (es un
+único ajuste, compartido con el chat). Cada evaluación crea su propia sesión, así que todas
+sus llamadas llevan el token de esa sesión, y el registro en vivo lo avisa al arrancar.
 
 ---
 

@@ -652,6 +652,7 @@ export default function App() {
               systemPrompt,
               sendSessionToken,
             }}
+            onSendSessionTokenChange={setSendSessionToken}
             agentModels={models}
             apiKeys={apiKeys}
             mcp={{ connIds: selectedConns, servers: selectedConns.length, tools: toolsCount }}

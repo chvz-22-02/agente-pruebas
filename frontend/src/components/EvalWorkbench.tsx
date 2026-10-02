@@ -10,6 +10,8 @@ type Props = {
   active: boolean;
   config: BackendConfig | null;
   agent: AgentSettings;
+  /** El boton session_token es el mismo ajuste que en el chat. */
+  onSendSessionTokenChange: (value: boolean) => void;
   agentModels: string[];
   apiKeys: Record<string, string>;
   mcp: { connIds: string[]; servers: number; tools: number };
@@ -36,6 +38,7 @@ export default function EvalWorkbench({
   active,
   config,
   agent,
+  onSendSessionTokenChange,
   agentModels,
   apiKeys,
   mcp,
@@ -261,6 +264,7 @@ export default function EvalWorkbench({
             <EvalSetup
               config={config}
               agent={agent}
+              onSendSessionTokenChange={onSendSessionTokenChange}
               agentModels={agentModels}
               apiKeys={apiKeys}
               mcp={mcp}
