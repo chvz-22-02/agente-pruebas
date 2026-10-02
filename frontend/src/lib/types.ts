@@ -60,6 +60,8 @@ export type ChatItem =
       seq: number;
       tool: string;
       args: any;
+      /** Argumentos que puso el agente (no el modelo), p.ej. `session_token`. */
+      injected?: string[];
       server?: ServerRef;
       status: "running" | "ok" | "error";
       result?: string;
@@ -86,6 +88,8 @@ export type Session = {
   total_tokens: number;
   /** Experimento de MLflow donde se registra. Vacio = el del backend. */
   mlflow_experiment?: string;
+  /** Token propio de la sesion; se envia como `session_token` si se activa en el chat. */
+  session_token?: string;
   /** `kind: "evaluation"` en las sesiones creadas por una evaluacion. */
   metadata?: { kind?: string; eval_run_id?: string; [key: string]: any };
 };

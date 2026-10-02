@@ -82,6 +82,7 @@ async def start_run(payload: StartEvalRequest) -> dict:
         simulator=_role(payload.simulator, agent),
         judge=_role(payload.judge, agent),
         mcp_conn_ids=payload.mcp_conn_ids,
+        send_session_token=payload.send_session_token,
         name=payload.name,
         suite=payload.suite,
         mlflow_experiment=payload.mlflow_experiment,

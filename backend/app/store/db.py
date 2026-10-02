@@ -36,7 +36,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     metadata          TEXT NOT NULL DEFAULT '{}',
     -- Experimento de MLflow donde se registran los runs de esta sesion.
     -- Vacio => el de la configuracion del backend.
-    mlflow_experiment TEXT NOT NULL DEFAULT ''
+    mlflow_experiment TEXT NOT NULL DEFAULT '',
+    -- Token propio de la sesion. El agente lo puede inyectar como argumento
+    -- `session_token` en cada llamada a herramienta (ver ToolRouter).
+    session_token     TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS conversations (
@@ -198,6 +201,7 @@ def loads(value: str | None, fallback: Any = None) -> Any:
 # "ADD COLUMN IF NOT EXISTS", asi que se comprueba con PRAGMA table_info.
 MIGRATIONS: list[tuple[str, str, str]] = [
     ("sessions", "mlflow_experiment", "TEXT NOT NULL DEFAULT ''"),
+    ("sessions", "session_token", "TEXT NOT NULL DEFAULT ''"),
     # El banco de pruebas paso de dos YAML a personas.json + consultas.json.
     ("eval_runs", "personas_json", "TEXT NOT NULL DEFAULT ''"),
     ("eval_runs", "consultas_json", "TEXT NOT NULL DEFAULT ''"),

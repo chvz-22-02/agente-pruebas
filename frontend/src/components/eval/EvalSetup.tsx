@@ -11,11 +11,14 @@ export type AgentSettings = {
   thinking: boolean;
   maxIterations: number;
   systemPrompt: string;
+  /** Inyectar el token de la sesion como `session_token` en cada herramienta. */
+  sendSessionToken: boolean;
 };
 
 type Props = {
   config: BackendConfig | null;
   agent: AgentSettings;
+  onSendSessionTokenChange: (value: boolean) => void;
   agentModels: string[];
   apiKeys: Record<string, string>;
   mcp: { connIds: string[]; servers: number; tools: number };
@@ -285,6 +288,7 @@ function RoleEditor({
 export default function EvalSetup({
   config,
   agent,
+  onSendSessionTokenChange,
   agentModels,
   apiKeys,
   mcp,
@@ -432,6 +436,8 @@ export default function EvalSetup({
       simulator: rolePayload(simulator, prompts.simulator),
       judge: rolePayload(judge, prompts.judge),
       mcp_conn_ids: mcp.connIds,
+      // Cada evaluacion tiene su propia sesion y, por tanto, su propio token.
+      send_session_token: agent.sendSessionToken,
       // Vacio = todos; se manda la lista solo si hay descartes.
       case_ids: excludedCases.length ? includedCases.map((c) => c.id) : [],
       persona_ids: excludedPersonas.length ? includedPersonas.map((p) => p.id) : [],
@@ -615,6 +621,20 @@ export default function EvalSetup({
         <div className="eval-role">
           <div className="row" style={{ marginBottom: 4 }}>
             <strong style={{ fontSize: 12 }}>Agente bajo prueba</strong>
+            <div style={{ flex: 1 }} />
+            <button
+              className={`tiny ${agent.sendSessionToken ? "primary" : ""}`}
+              aria-pressed={agent.sendSessionToken}
+              onClick={() => onSendSessionTokenChange(!agent.sendSessionToken)}
+              disabled={starting}
+              title={
+                "Anade el token de la sesion como argumento fijo `session_token` en todas las llamadas a " +
+                "herramientas. Lo pone el agente, no el modelo. Cada evaluacion crea su propia sesion, " +
+                "asi que usa su propio token. Es el mismo ajuste que el boton del chat."
+              }
+            >
+              session_token: {agent.sendSessionToken ? "ON" : "OFF"}
+            </button>
           </div>
           <div className="muted">
             {agent.provider} / <code>{agent.model || "-"}</code> · temp. {agent.temperature} ·{" "}

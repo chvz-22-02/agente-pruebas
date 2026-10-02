@@ -169,10 +169,59 @@ def test_router_turns_a_dead_server_into_an_observation() -> None:
         router = ToolRouter.__new__(ToolRouter)
         router.manager = _Manager()  # type: ignore[assignment]
         router._map = {"consultar": (conn.conn_id, "consultar")}
+        router.injected = {}
 
         result = await router.call("consultar", {})
         assert result.ok is False
         assert result.tool_name == "consultar"
         assert "se cerro" in (result.error or ""), result.error
+
+    asyncio.run(scenario())
+
+
+def test_router_injects_fixed_arguments_the_model_cannot_touch() -> None:
+    """`session_token` lo pone el agente: el modelo no lo ve ni lo puede cambiar."""
+
+    async def scenario() -> None:
+        from app.llm.base import ToolSpec
+        from app.mcpclient.manager import ToolRouter
+        from app.mcpclient.models import MCPToolResult
+
+        sent: dict[str, Any] = {}
+        schema = {
+            "type": "object",
+            "properties": {"consulta": {"type": "string"}, "session_token": {"type": "string"}},
+            "required": ["consulta", "session_token"],
+        }
+
+        class _Conn:
+            conn_id = "c1"
+            server_info = {"name": "demo"}
+            tools = [ToolSpec(name="consultar", description="", input_schema=schema)]
+
+            async def call_tool(self, name: str, arguments: dict[str, Any]) -> MCPToolResult:
+                sent.update(arguments)
+                return MCPToolResult(tool_name=name, arguments=arguments, ok=True, text="ok")
+
+        class _Manager:
+            def get(self, _conn_id: str) -> Any:
+                return _Conn()
+
+        router = ToolRouter(_Manager(), ["c1"], injected={"session_token": "tok-fijo"})  # type: ignore[arg-type]
+
+        # El esquema que ve el modelo no lo incluye; el de la conexion, si.
+        exposed = router.specs[0].input_schema
+        assert "session_token" not in exposed["properties"]
+        assert exposed["required"] == ["consulta"]
+        assert "session_token" in schema["properties"]
+
+        # Aunque el modelo invente uno, viaja el de la sesion.
+        await router.call("consultar", {"consulta": "x", "session_token": "inventado"})
+        assert sent == {"consulta": "x", "session_token": "tok-fijo"}
+
+        # Sin inyeccion, el esquema y los argumentos quedan intactos.
+        plain = ToolRouter(_Manager(), ["c1"])  # type: ignore[arg-type]
+        assert plain.specs[0].input_schema is schema
+        assert plain.with_injected({"consulta": "x"}) == {"consulta": "x"}
 
     asyncio.run(scenario())

@@ -129,6 +129,8 @@ class StartEvalRequest(BaseModel):
     simulator: EvalRoleModel | None = None
     judge: EvalRoleModel | None = None
     mcp_conn_ids: list[str] = Field(default_factory=list)
+    # Inyecta el token de la sesion de la evaluacion como `session_token`.
+    send_session_token: bool = False
     # Filtros de la UI; vacio => todos.
     case_ids: list[str] = Field(default_factory=list)
     persona_ids: list[str] = Field(default_factory=list)
@@ -157,3 +159,6 @@ class ChatRequest(BaseModel):
     # Clave del proveedor de nube. Se usa solo para esta peticion: ni se
     # guarda en la base de datos ni se registra en MLflow.
     api_key: str | None = None
+    # Si es True, el agente anade `session_token` (el de la sesion) a todas
+    # las llamadas a herramientas, sin que lo decida el modelo.
+    send_session_token: bool = False

@@ -11,6 +11,11 @@ type Props = {
   toolsCount: number;
   serversCount: number;
   conversationId: string | null;
+  /** Boton "session_token": el agente lo anade a cada llamada a herramienta. */
+  sendSessionToken: boolean;
+  onSendSessionTokenChange: (value: boolean) => void;
+  /** Token de la sesion abierta; vacio si aun no existe (se crea con el primer mensaje). */
+  sessionToken: string;
 };
 
 const ms = (v?: number) => (v === undefined ? "-" : `${Math.round(v)} ms`);
@@ -43,7 +48,18 @@ function ToolBlock({ item }: { item: Extract<ChatItem, { kind: "tool" }> }) {
         <span className="muted">{item.status === "running" ? "ejecutando..." : ms(item.latencyMs)}</span>
       </summary>
       <div className="inner">
-        <div className="muted">Argumentos</div>
+        <div className="muted">
+          Argumentos
+          {!!item.injected?.length && (
+            <span>
+              {" "}
+              · inyectados por el agente, no por el modelo:{" "}
+              {item.injected.map((name) => (
+                <code key={name}>{name} </code>
+              ))}
+            </span>
+          )}
+        </div>
         <Json value={item.args} />
         {item.error && (
           <>
@@ -105,6 +121,9 @@ export default function Chat({
   toolsCount,
   serversCount,
   conversationId,
+  sendSessionToken,
+  onSendSessionTokenChange,
+  sessionToken,
 }: Props) {
   const [text, setText] = useState("");
   const endRef = useRef<HTMLDivElement>(null);
@@ -129,6 +148,19 @@ export default function Chat({
         <span className="muted">
           {serversCount} MCP · {toolsCount} herramientas
         </span>
+        <button
+          className={`tiny ${sendSessionToken ? "primary" : ""}`}
+          aria-pressed={sendSessionToken}
+          onClick={() => onSendSessionTokenChange(!sendSessionToken)}
+          disabled={streaming}
+          title={
+            "Anade el token de la sesion como argumento fijo `session_token` en todas las llamadas a " +
+            "herramientas. Lo pone el agente, no el modelo.\n" +
+            (sessionToken ? `Token: ${sessionToken}` : "El token se genera con la sesion.")
+          }
+        >
+          session_token: {sendSessionToken ? "ON" : "OFF"}
+        </button>
         <button className="tiny" onClick={onReset} disabled={streaming} title="Empieza un hilo nuevo sin memoria previa">
           Reiniciar conversacion
         </button>

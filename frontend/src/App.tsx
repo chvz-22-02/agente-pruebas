@@ -24,6 +24,7 @@ type Mode = "chat" | "eval";
 const SELECTED_KEY = "agente-pruebas:mcp-selected";
 const EXPERIMENT_KEY = "agente-pruebas:mlflow-experiment";
 const MODE_KEY = "agente-pruebas:mode";
+const SESSION_TOKEN_KEY = "agente-pruebas:send-session-token";
 
 export default function App() {
   const [config, setConfig] = useState<BackendConfig | null>(null);
@@ -75,6 +76,12 @@ export default function App() {
   // Claves de API por proveedor. Viven en el navegador y viajan en cada
   // peticion; el backend no las persiste (ver lib/api.ts).
   const [apiKeys, setApiKeys] = useState<Record<string, string>>(() => loadApiKeys());
+  // Si esta activo, el backend anade el token de la sesion como argumento
+  // `session_token` en todas las llamadas a herramientas. Lo inyecta el
+  // agente de forma fija: el modelo ni lo ve ni lo puede cambiar.
+  const [sendSessionToken, setSendSessionToken] = useState<boolean>(
+    () => localStorage.getItem(SESSION_TOKEN_KEY) === "1",
+  );
 
   const abortRef = useRef<AbortController | null>(null);
   const defaultsApplied = useRef(false);
@@ -157,6 +164,10 @@ export default function App() {
   useEffect(() => {
     saveApiKeys(apiKeys);
   }, [apiKeys]);
+
+  useEffect(() => {
+    localStorage.setItem(SESSION_TOKEN_KEY, sendSessionToken ? "1" : "0");
+  }, [sendSessionToken]);
 
   /**
    * Al arrancar se abre la sesion mas reciente, si la hay. Nunca se crea una
@@ -476,6 +487,7 @@ export default function App() {
               seq: event.seq,
               tool: event.tool,
               args: event.arguments,
+              injected: event.injected,
               server: event.server,
               status: "running",
               ts: event.ts,
@@ -536,6 +548,7 @@ export default function App() {
           thinking,
           system_prompt: systemPrompt,
           max_iterations: maxIterations,
+          send_session_token: sendSessionToken,
         },
         apply,
         controller.signal,
@@ -619,6 +632,9 @@ export default function App() {
             toolsCount={toolsCount}
             serversCount={selectedConns.length}
             conversationId={conversationId}
+            sendSessionToken={sendSessionToken}
+            onSendSessionTokenChange={setSendSessionToken}
+            sessionToken={sessions.find((s) => s.id === sessionId)?.session_token || ""}
           />
         </div>
 
@@ -626,7 +642,17 @@ export default function App() {
           <EvalWorkbench
             active={mode === "eval"}
             config={config}
-            agent={{ provider, baseUrl, model, temperature, thinking, maxIterations, systemPrompt }}
+            agent={{
+              provider,
+              baseUrl,
+              model,
+              temperature,
+              thinking,
+              maxIterations,
+              systemPrompt,
+              sendSessionToken,
+            }}
+            onSendSessionTokenChange={setSendSessionToken}
             agentModels={models}
             apiKeys={apiKeys}
             mcp={{ connIds: selectedConns, servers: selectedConns.length, tools: toolsCount }}

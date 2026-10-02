@@ -461,6 +461,93 @@ async def _mcp_reconnect(tmp_path: Path) -> None:
         await db.close()
 
 
+class ToolCallingAgentLLM(_Scripted):
+    """Llama una vez a la herramienta (inventando un session_token) y responde."""
+
+    seen_schemas: list[dict[str, Any]] = []
+
+    async def chat(self, messages: list[dict[str, Any]], tools: list[ToolSpec] | None = None,
+                   **kwargs: Any) -> LLMResponse:
+        from app.llm.base import ToolCall
+
+        type(self).seen_schemas.extend(t.input_schema for t in tools or [])
+        if messages[-1]["role"] == "tool":
+            return LLMResponse(content=AGENT_ANSWER, usage=Usage(100, 20, 120), latency_ms=5.0)
+        call = ToolCall(name="consultar", arguments={"consulta": "pobreza", "session_token": "inventado"})
+        return LLMResponse(content="", tool_calls=[call], usage=Usage(100, 20, 120), latency_ms=5.0)
+
+
+def test_evaluation_injects_its_own_session_token(tmp_path: Path) -> None:
+    """Con send_session_token, cada llamada lleva el token de la sesion de la evaluacion."""
+    asyncio.run(_eval_session_token(tmp_path))
+
+
+async def _eval_session_token(tmp_path: Path) -> None:
+    from app.evals.runner import AgentModel, EvalRequest, RoleModel, eval_manager
+    from app.llm import registry
+    from app.mcpclient.manager import mcp_manager
+    from app.mcpclient.models import MCPServerConfig, MCPToolResult
+    from app.store import repository as repo
+    from app.store.db import db
+
+    sent: list[dict[str, Any]] = []
+    schema = {
+        "type": "object",
+        "properties": {"consulta": {"type": "string"}, "session_token": {"type": "string"}},
+        "required": ["consulta", "session_token"],
+    }
+
+    class FakeConn:
+        conn_id = "mcp_token"
+        is_alive = True
+        server_info = {"name": "demo"}
+        config = MCPServerConfig(url="https://mcp.ejemplo/mcp")
+        tools = [ToolSpec(name="consultar", description="", input_schema=schema)]
+
+        def describe(self) -> dict[str, Any]:
+            return {"conn_id": self.conn_id, "config": self.config.public(),
+                    "server_info": self.server_info, "tools": [{"name": "consultar"}]}
+
+        async def call_tool(self, name: str, arguments: dict[str, Any]) -> MCPToolResult:
+            sent.append(arguments)
+            return MCPToolResult(tool_name=name, arguments=arguments, ok=True, text="30,0 % - 33,8 %")
+
+    ToolCallingAgentLLM.seen_schemas = []
+    registry.PROVIDERS.update({"s_tool_agent": ToolCallingAgentLLM, "s_sim": SimulatorLLM, "s_judge": JudgeLLM})  # type: ignore[dict-item]
+    mcp_manager._connections[FakeConn.conn_id] = FakeConn()  # type: ignore[assignment]
+    db.path = str(tmp_path / "token.sqlite3")
+    await db.connect()
+    try:
+        job = await eval_manager.start(
+            EvalRequest(
+                personas_json=PERSONAS,
+                consultas_json=CASES,
+                agent=AgentModel(provider="s_tool_agent", base_url="http://scripted", model="agente"),
+                simulator=RoleModel(provider="s_sim", base_url="http://scripted", model="simulador"),
+                judge=RoleModel(provider="s_judge", base_url="http://scripted", model="juez"),
+                mcp_conn_ids=[FakeConn.conn_id],
+                send_session_token=True,
+                case_ids=["PG-01"],
+            )
+        )
+        events = [e async for e in eval_manager.stream(job, 0)]
+        run = await repo.get_eval_run(job.id)
+        assert run is not None and run["status"] in {"done", "failed"}, (run["status"], run["error"])
+
+        token = (await repo.get_session(job.session_id) or {}).get("session_token")
+        assert token and sent, (token, sent)
+        # Llega el token de la sesion de la evaluacion, no el que invento el modelo.
+        assert all(a == {"consulta": "pobreza", "session_token": token} for a in sent), sent
+        # El modelo nunca vio el parametro en el esquema.
+        assert ToolCallingAgentLLM.seen_schemas
+        assert all("session_token" not in s["properties"] for s in ToolCallingAgentLLM.seen_schemas)
+        assert run["config"]["send_session_token"] is True
+        assert any(e["type"] == "log" and "session_token" in e.get("message", "") for e in events)
+    finally:
+        mcp_manager._connections.pop(FakeConn.conn_id, None)
+        await db.close()
+
+
 class SaturatedThenFineAgentLLM(_Scripted):
     """La primera consulta agota los reintentos del proveedor; la repeticion va bien."""
 
